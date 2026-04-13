@@ -1,435 +1,171 @@
-# Sandboxing LLM Agents (Claude Code / opencode)
+# `copilot-box`: GitHub Copilot CLI in a controlled container
 
-Running LLM agents in Docker containers provides a clean separation between the agent's workspace and your host system. This guide covers practical setup for Claude Code and opencode with proper credential handling.
+`copilot-box` is a thin wrapper around the GitHub Copilot CLI that keeps the Copilot experience familiar while adding container isolation and operator-controlled networking.
 
-## What Container Isolation Provides
+## What changed
 
-| Boundary | Description |
-|----------|-------------|
-| Filesystem | Agent only sees explicitly mounted directories |
-| Processes | Cannot interact with host processes |
-| User context | Runs as non-root user, mapped to your UID |
-| Credentials | Only secrets you explicitly pass are available |
-| Network | Full access for API calls, git, and integrations |
+This repository is now intentionally **GitHub Copilot-specific**:
 
-## Practical Security Model
+- one container image
+- one launcher: `./copilot-box`
+- one auth/session home inside the container
+- static inbound policy: no published ports
+- dynamic outbound approvals through a host-side proxy
 
-The container acts as a disposable workspace. The key benefits:
-
-1. **Clean slate each run** - Containers are created fresh and removed after use (`--rm`)
-2. **Explicit resource access** - You choose exactly which directories and credentials to expose
-3. **Easy rotation** - If you want fresh credentials, just generate new ones and update your env vars
-4. **Reproducible environment** - Same container image works across machines
-
-For additional caution, you can periodically discard containers and rotate any exposed credentials. This is straightforward since credentials are passed via environment variables rather than stored in the container.
-
----
-
-## Quick Start (Vertex AI)
-
-Tested and working:
+The wrapper is designed to feel Copilot-like. Anything that is not a `copilot-box` policy command is passed straight through to `copilot`, so flows such as:
 
 ```bash
-# Build
-docker build -t claude-sandbox .
-
-# Run (interactive)
-docker run -it --rm \
-  --user "$(id -u):$(id -g)" \
-  -e CLAUDE_CODE_USE_VERTEX=1 \
-  -e ANTHROPIC_VERTEX_PROJECT_ID="$ANTHROPIC_VERTEX_PROJECT_ID" \
-  -e CLOUD_ML_REGION="$CLOUD_ML_REGION" \
-  -e GOOGLE_APPLICATION_CREDENTIALS="/home/claude/.config/gcloud/application_default_credentials.json" \
-  -v "$HOME/.config/gcloud":/home/claude/.config/gcloud:ro \
-  -v "$(pwd)":/workspace \
-  --cap-drop=ALL \
-  --security-opt=no-new-privileges \
-  claude-sandbox
+./copilot-box
+./copilot-box --resume <session-id>
+./copilot-box --experimental
 ```
 
----
+stay close to the normal Copilot CLI mental model.
 
-## Directory Structure
+## How it works
 
-```
-~/.claude-docker/
-├── config-repo/          # Your skills, CLAUDE.md, commands (git repo)
-│   ├── CLAUDE.md
-│   ├── commands/
-│   └── skills/
-├── auth/                 # OAuth tokens (Copilot, etc.)
-├── conversations/        # Persisted conversation history
-└── secrets.env           # API keys (never commit this)
-```
+### Runtime
 
-For opencode, the structure mirrors its config expectations:
-```
-~/.opencode-docker/
-├── config-repo/
-│   └── opencode.json     # or equivalent config
-├── auth/
-└── secrets.env
-```
+The image installs `@github/copilot` and runs `copilot` as the container entrypoint.
 
----
+### Session persistence
 
-## Dockerfile
-
-```dockerfile
-FROM node:22-slim
-
-RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
-RUN npm install -g @anthropic-ai/claude-code
-
-RUN useradd -m -s /bin/bash claude
-USER claude
-
-RUN mkdir -p /home/claude/.claude /home/claude/.config/gcloud
-WORKDIR /workspace
-
-ENTRYPOINT ["claude"]
-```
-
-Build:
-```bash
-docker build -t claude-sandbox .
-```
-
----
-
-## Authentication
-
-### Direct API Keys
-
-Pass key as environment variable:
+Copilot state is stored outside the container at:
 
 ```bash
-docker run -it --rm \
-  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-  ...
+~/.copilot-box/container-home
 ```
 
-### Vertex AI (Google Cloud)
+That means auth and Copilot-managed session data survive container restarts, and the container always gets a writable home directory.
 
-Requires GCP credentials and the `CLAUDE_CODE_USE_VERTEX=1` flag. Use Application Default Credentials:
+### Egress control
+
+All HTTP and HTTPS traffic is sent through a local proxy started by `./copilot-box`.
+
+The proxy:
+
+- allows a small default set of GitHub/Copilot hosts
+- logs blocked destinations to per-project state
+- reloads the allowlist on every request
+
+That last point is what makes live approval work: approving a hostname updates the file the proxy reads, so the running session can continue without restarting in the common case.
+
+Per-project policy state lives under:
 
 ```bash
-# On host first (one-time)
-gcloud auth application-default login
-
-# Mount credentials into container
-docker run -it --rm \
-  --user "$(id -u):$(id -g)" \
-  -e CLAUDE_CODE_USE_VERTEX=1 \
-  -e ANTHROPIC_VERTEX_PROJECT_ID="$ANTHROPIC_VERTEX_PROJECT_ID" \
-  -e CLOUD_ML_REGION="${CLOUD_ML_REGION:-europe-west1}" \
-  -e GOOGLE_APPLICATION_CREDENTIALS="/home/claude/.config/gcloud/application_default_credentials.json" \
-  -v "$HOME/.config/gcloud":/home/claude/.config/gcloud:ro \
-  ...
+~/.copilot-box/projects/<workspace-hash>/
 ```
 
-**Note**: The `--user "$(id -u):$(id -g)"` flag is required so the container can read your gcloud credentials.
+Important files:
 
-Or use a service account key file:
-```bash
--v "/path/to/service-account.json":/secrets/key.json:ro \
--e GOOGLE_APPLICATION_CREDENTIALS="/secrets/key.json" \
--e CLAUDE_CODE_USE_VERTEX=1
-```
+- `allowed-hosts.txt` — persistent allowlist for that workspace
+- `pending.jsonl` — blocked outbound attempts
+- `proxy.log` — proxy stderr/stdout
+- `session-meta.json` — wrapper-level metadata about the last launch
 
-### AWS Bedrock
+### Ingress control
 
-```bash
-docker run -it --rm \
-  -e AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
-  -e AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
-  -e AWS_REGION="us-east-1" \
-  ...
-```
+Ingress is intentionally simple and static:
 
-### GitHub Copilot (OAuth)
+- the container runs with bridge networking
+- no ports are published
+- there is no in-session inbound approval flow
 
-Copilot requires interactive OAuth device flow:
+## Requirements
+
+- `docker` or `podman`
+- `python3`
+- `node` only for building the image locally if you want to inspect or extend it; it is not required by the wrapper itself
+
+`./copilot-box` auto-detects `docker` first and falls back to `podman`.
+
+## Build
 
 ```bash
-# Run with auth persistence
-docker run -it --rm \
-  -v "$HOME/.claude-docker/auth":/home/claude/.claude/auth \
-  claude-sandbox /login github-copilot
+./copilot-box build
 ```
-
-The token persists in `~/.claude-docker/auth/` for future sessions.
-
----
-
-## Passing Secrets
-
-### Environment Variables (Recommended)
-
-Map host env vars to container env vars:
-
-```bash
-docker run -it --rm \
-  -e ANTHROPIC_API_KEY="${MY_CORP_KEY}" \
-  -e GITHUB_TOKEN="${GHE_TOKEN}" \
-  -e OPENAI_API_KEY="${AZURE_KEY}" \
-  ...
-```
-
-### Env File
-
-Create `~/.claude-docker/secrets.env`:
-```bash
-ANTHROPIC_API_KEY=sk-ant-...
-GITHUB_TOKEN=ghp_...
-```
-
-Use with:
-```bash
-docker run -it --rm \
-  --env-file ~/.claude-docker/secrets.env \
-  ...
-```
-
-### Combined Approach
-
-Use env file for stable secrets, override specific ones via `-e`:
-
-```bash
-docker run -it --rm \
-  --env-file ~/.claude-docker/secrets.env \
-  -e ANTHROPIC_API_KEY="${DIFFERENT_KEY}" \
-  ...
-```
-
----
-
-## Passing Configuration Files
-
-### Claude Code
-
-Mount your config repo to `/home/claude/.claude`:
-
-```bash
--v "$HOME/.claude-docker/config-repo":/home/claude/.claude:ro
-```
-
-The repo contains:
-- `CLAUDE.md` - Global instructions
-- `commands/` - Custom slash commands
-- `skills/` - Skill definitions
-
-### opencode
-
-Mount config to opencode's expected location:
-
-```bash
--v "$HOME/.opencode-docker/config-repo":/home/opencode/.config/opencode:ro
-```
-
-### Project-Specific Config
-
-Your project's `.claude/` directory is included when you mount the project:
-
-```bash
--v "/path/to/project":/workspace
-# Project's /path/to/project/.claude/ is accessible at /workspace/.claude/
-```
-
----
-
-## Run Script
-
-Save as `~/bin/claude-sandbox` and `chmod +x`:
-
-```bash
-#!/bin/bash
-set -euo pipefail
-
-CONFIG_DIR="$HOME/.claude-docker"
-PROJECT_DIR="${1:-$(pwd)}"
-
-# Env var mappings (host var -> container var)
-ENV_MAPPINGS=(
-  -e "ANTHROPIC_API_KEY=${CORP_ANTHROPIC_KEY:-${ANTHROPIC_API_KEY:-}}"
-  -e "GITHUB_TOKEN=${GHE_TOKEN:-}"
-  -e "ANTHROPIC_VERTEX_PROJECT_ID=${ANTHROPIC_VERTEX_PROJECT_ID:-}"
-  -e "CLOUD_ML_REGION=${CLOUD_ML_REGION:-europe-west1}"
-  -e "CLAUDE_CODE_USE_VERTEX=${CLAUDE_CODE_USE_VERTEX:-}"
-)
-
-# Secrets file (optional)
-SECRETS_OPTS=()
-[[ -f "$CONFIG_DIR/secrets.env" ]] && SECRETS_OPTS=(--env-file "$CONFIG_DIR/secrets.env")
-
-# GCP credentials (optional)
-GCP_OPTS=()
-if [[ -f "$HOME/.config/gcloud/application_default_credentials.json" ]]; then
-  GCP_OPTS=(
-    -v "$HOME/.config/gcloud":/home/claude/.config/gcloud:ro
-    -e "GOOGLE_APPLICATION_CREDENTIALS=/home/claude/.config/gcloud/application_default_credentials.json"
-  )
-fi
-
-# Ensure directories exist
-mkdir -p "$CONFIG_DIR/auth" "$CONFIG_DIR/conversations"
-
-docker run -it --rm \
-  "${ENV_MAPPINGS[@]}" \
-  "${SECRETS_OPTS[@]:-}" \
-  "${GCP_OPTS[@]:-}" \
-  -v "$PROJECT_DIR":/workspace \
-  -v "$CONFIG_DIR/config-repo":/home/claude/.claude:ro \
-  -v "$CONFIG_DIR/auth":/home/claude/.claude/auth \
-  -v "$CONFIG_DIR/conversations":/home/claude/.claude/conversations \
-  --cap-drop=ALL \
-  --security-opt=no-new-privileges \
-  --user "$(id -u):$(id -g)" \
-  claude-sandbox "${@:2}"
-```
-
----
 
 ## Usage
 
-```bash
-# Interactive session in current directory
-claude-sandbox
-
-# Specific project
-claude-sandbox /path/to/project
-
-# With initial prompt
-claude-sandbox . "explain this codebase"
-
-# One-shot command
-claude-sandbox /path/to/project "fix the failing tests"
-```
-
----
-
-## Additional Network Controls (Optional)
-
-For scenarios requiring tighter control over network access, you can restrict outbound connections to specific hosts:
+Start Copilot in the current directory:
 
 ```bash
-docker run -it --rm \
-  --dns=127.0.0.1 \
-  --add-host="api.anthropic.com:$(dig +short api.anthropic.com | head -1)" \
-  --add-host="europe-west1-aiplatform.googleapis.com:$(dig +short europe-west1-aiplatform.googleapis.com | head -1)" \
-  ...
+./copilot-box
 ```
 
-This allows API calls while limiting other outbound traffic. Note that this requires maintaining the allowlist as endpoints change.
-
----
-
-## Quick Setup
+Resume a Copilot session:
 
 ```bash
-# 1. Build image
-docker build -t claude-sandbox .
-
-# 2. Create directory structure
-mkdir -p ~/.claude-docker/{config-repo,auth,conversations}
-
-# 3. Create minimal config
-echo "# My Claude Config" > ~/.claude-docker/config-repo/CLAUDE.md
-
-# 4. Create secrets file
-cat > ~/.claude-docker/secrets.env << 'EOF'
-ANTHROPIC_API_KEY=sk-ant-...
-EOF
-chmod 600 ~/.claude-docker/secrets.env
-
-# 5. Install run script
-cp claude-sandbox.sh ~/bin/claude-sandbox
-chmod +x ~/bin/claude-sandbox
-
-# 6. Run
-claude-sandbox /path/to/project
+./copilot-box --resume <session-id>
 ```
 
----
-
-## opencode Setup
-
-opencode is an alternative LLM coding agent. Key differences from Claude Code:
-
-| Feature | Claude Code | opencode |
-|---------|-------------|----------|
-| Claude via Vertex | ✅ `CLAUDE_CODE_USE_VERTEX=1` | ❌ Not supported |
-| Claude via API | ✅ `ANTHROPIC_API_KEY` | ✅ `ANTHROPIC_API_KEY` |
-| Gemini via Vertex | ❌ | ✅ `GOOGLE_CLOUD_PROJECT` |
-| Install method | npm | npm |
-
-### Dockerfile.opencode
-
-```dockerfile
-FROM node:22-slim
-
-RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
-RUN npm install -g opencode-ai@latest
-
-RUN useradd -m -s /bin/bash opencode
-USER opencode
-
-RUN mkdir -p /home/opencode/.config/opencode /home/opencode/.config/gcloud
-WORKDIR /workspace
-
-ENTRYPOINT ["opencode"]
-```
-
-Build:
-```bash
-docker build -t opencode-sandbox -f Dockerfile.opencode .
-```
-
-### opencode-sandbox.sh
+See blocked outbound destinations for the current workspace:
 
 ```bash
-#!/bin/bash
-set -euo pipefail
-
-PROJECT_DIR="${1:-$(pwd)}"
-
-TTY_FLAG="-it"
-if [[ ! -t 0 ]] || [[ "${*}" == *"run"* ]]; then
-  TTY_FLAG=""
-fi
-
-docker run $TTY_FLAG --rm \
-  --user "$(id -u):$(id -g)" \
-  -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
-  -e GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-}" \
-  -e VERTEX_LOCATION="${VERTEX_LOCATION:-europe-west1}" \
-  -e GOOGLE_APPLICATION_CREDENTIALS="/home/opencode/.config/gcloud/application_default_credentials.json" \
-  -v "$HOME/.config/gcloud":/home/opencode/.config/gcloud:ro \
-  -v "$PROJECT_DIR":/workspace \
-  --cap-drop=ALL \
-  --security-opt=no-new-privileges \
-  opencode-sandbox "${@:2}"
+./copilot-box pending
 ```
 
-### Usage
+See the current allowlist:
 
 ```bash
-# Interactive with Gemini (uses your Vertex credentials)
-./opencode-sandbox.sh /path/to/project
-
-# Non-interactive with specific model
-./opencode-sandbox.sh . run --model google-vertex/gemini-2.5-flash "explain this code"
-
-# With Anthropic API key (if you have one)
-ANTHROPIC_API_KEY=sk-ant-... ./opencode-sandbox.sh . run --model anthropic/claude-sonnet-4-5 "hello"
+./copilot-box allowed
 ```
 
-### Available Models
+Approve a destination for future and current requests:
 
 ```bash
-# List Gemini models on Vertex
-docker run --rm opencode-sandbox models google-vertex
-
-# List Anthropic models (requires ANTHROPIC_API_KEY)
-docker run --rm -e ANTHROPIC_API_KEY=sk-ant-... opencode-sandbox models anthropic
+./copilot-box allow objects-origin.githubusercontent.com
 ```
+
+Remove an approved destination:
+
+```bash
+./copilot-box deny objects-origin.githubusercontent.com
+```
+
+If you prefer token-based auth, `GH_TOKEN` or `GITHUB_TOKEN` is passed through into the container. Otherwise, log in inside Copilot with `/login`.
+
+## Default allowed hosts
+
+The initial workspace allowlist contains:
+
+- `api.github.com`
+- `api.githubcopilot.com`
+- `codeload.github.com`
+- `github.com`
+- `githubcopilot.com`
+- `objects.githubusercontent.com`
+- `raw.githubusercontent.com`
+- `uploads.github.com`
+
+If Copilot or your workflow needs something else, it will show up via `./copilot-box pending`.
+
+## Caveats
+
+This implementation is intentionally simple and practical:
+
+- live approvals are implemented for HTTP/HTTPS traffic mediated by the proxy
+- non-HTTP protocols are not yet mediated by the same approval path
+- proxy-based control is strong for visibility and ergonomics, but it is not the same thing as a full host firewall
+
+If you later want stricter enforcement, the next step is to combine this with runtime-specific firewalling or a dedicated network namespace policy layer.
+
+## Tests
+
+There is a lightweight automated test script at:
+
+```bash
+./tests/test_box.sh
+```
+
+It covers:
+
+- booting the real `copilot-box` image
+- allowlist persistence through `copilot-box allow` and `copilot-box deny`
+- a live approval flow where a running container is blocked, the host approves the destination, and the same running session succeeds without restart
+
+These tests are intentionally **offline**:
+
+- they do not require Copilot login
+- they do not send inference requests
+- they do not consume model quota

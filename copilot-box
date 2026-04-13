@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_ROOT="${COPILOT_BOX_HOME:-${LLM_BOX_HOME:-$HOME/.copilot-box}}"
+CONTAINER_HOME="$CONFIG_ROOT/container-home"
+IMAGE_NAME="${COPILOT_BOX_IMAGE:-${LLM_BOX_IMAGE:-copilot-box}}"
+STATE_ROOT="$CONFIG_ROOT/projects"
+
+DEFAULT_ALLOWED_HOSTS=(
+  api.github.com
+  api.githubcopilot.com
+  codeload.github.com
+  github.com
+  githubcopilot.com
+  objects.githubusercontent.com
+  raw.githubusercontent.com
+  uploads.github.com
+)
+
+usage() {
+  cat <<'EOF'
+Usage:
+  copilot-box build
+  copilot-box pending
+  copilot-box allowed
+  copilot-box allow <hostname>
+  copilot-box deny <hostname>
+  copilot-box [copilot arguments...]
+
+Examples:
+  copilot-box
+  copilot-box --resume <session-id>
+  copilot-box pending
+  copilot-box allow objects-origin.githubusercontent.com
+
+Environment:
+  COPILOT_BOX_HOME
+                     Override state directory (default: ~/.copilot-box)
+  COPILOT_BOX_IMAGE  Override container image name (default: copilot-box)
+  COPILOT_BOX_RUNTIME
+                     Force container runtime: docker or podman
+  COPILOT_BOX_PROXY_HOST
+                     Override the hostname used by the container to reach the host proxy
+EOF
+}
+
+fail() {
+  echo "copilot-box: $*" >&2
+  exit 1
+}
+
+detect_runtime() {
+  if [[ -n "${COPILOT_BOX_RUNTIME:-}" ]]; then
+    echo "$COPILOT_BOX_RUNTIME"
+    return
+  fi
+
+  if [[ -n "${LLM_BOX_RUNTIME:-}" ]]; then
+    echo "$LLM_BOX_RUNTIME"
+    return
+  fi
+
+  if command -v docker >/dev/null 2>&1; then
+    echo docker
+    return
+  fi
+
+  if command -v podman >/dev/null 2>&1; then
+    echo podman
+    return
+  fi
+
+  fail "no supported container runtime found (expected docker or podman)"
+}
+
+project_dir() {
+  python3 - "$PWD" <<'PY'
+import os
+import sys
+print(os.path.realpath(sys.argv[1]))
+PY
+}
+
+project_key() {
+  python3 - "$(project_dir)" <<'PY'
+import hashlib
+import sys
+print(hashlib.sha256(sys.argv[1].encode()).hexdigest())
+PY
+}
+
+project_state_dir() {
+  printf '%s/%s\n' "$STATE_ROOT" "$(project_key)"
+}
+
+allowed_hosts_file() {
+  printf '%s/allowed-hosts.txt\n' "$(project_state_dir)"
+}
+
+pending_log_file() {
+  printf '%s/pending.jsonl\n' "$(project_state_dir)"
+}
+
+proxy_log_file() {
+  printf '%s/proxy.log\n' "$(project_state_dir)"
+}
+
+proxy_ready_file() {
+  printf '%s/proxy-ready.json\n' "$(project_state_dir)"
+}
+
+session_meta_file() {
+  printf '%s/session-meta.json\n' "$(project_state_dir)"
+}
+
+ensure_state() {
+  local dir
+  dir="$(project_state_dir)"
+  mkdir -p "$CONTAINER_HOME/.copilot" "$CONTAINER_HOME/.local/state" "$STATE_ROOT" "$dir"
+
+  if [[ ! -f "$(allowed_hosts_file)" ]]; then
+    printf '%s\n' "${DEFAULT_ALLOWED_HOSTS[@]}" | sort -u >"$(allowed_hosts_file)"
+  fi
+
+  touch "$(pending_log_file)"
+}
+
+normalize_host() {
+  python3 - "$1" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+value = sys.argv[1].strip().lower()
+if not value:
+    raise SystemExit(1)
+
+if "://" in value:
+    value = urlparse(value).hostname or ""
+else:
+    value = value.split("/")[0]
+    value = value.split(":")[0]
+
+value = value.strip().strip(".")
+if not value:
+    raise SystemExit(1)
+
+print(value)
+PY
+}
+
+save_session_meta() {
+  python3 - "$(session_meta_file)" "$(project_dir)" "$@" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+path, workspace = sys.argv[1], sys.argv[2]
+payload = {
+    "workspace": workspace,
+    "last_started_at": datetime.now(timezone.utc).isoformat(),
+    "last_invocation": sys.argv[3:],
+}
+
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2)
+    handle.write("\n")
+PY
+}
+
+show_allowed() {
+  ensure_state
+  cat "$(allowed_hosts_file)"
+}
+
+show_pending() {
+  ensure_state
+  python3 - "$(allowed_hosts_file)" "$(pending_log_file)" <<'PY'
+import json
+import sys
+
+allowed_path, pending_path = sys.argv[1], sys.argv[2]
+
+allowed = {
+    line.strip().lower()
+    for line in open(allowed_path, encoding="utf-8")
+    if line.strip()
+}
+
+seen = set()
+items = []
+with open(pending_path, encoding="utf-8") as handle:
+    for line in handle:
+        line = line.strip()
+        if not line:
+            continue
+        event = json.loads(line)
+        host = event.get("host", "").lower()
+        if not host or host in allowed or host in seen:
+            continue
+        seen.add(host)
+        items.append((host, event.get("port", ""), event.get("timestamp", "")))
+
+for host, port, timestamp in items:
+    if port:
+        print(f"{host}:{port}\t{timestamp}")
+    else:
+        print(f"{host}\t{timestamp}")
+PY
+}
+
+allow_host() {
+  ensure_state
+  local host
+  host="$(normalize_host "${1:-}")" || fail "invalid hostname"
+
+  python3 - "$(allowed_hosts_file)" "$host" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+host = sys.argv[2]
+existing = {
+    line.strip().lower()
+    for line in path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+}
+existing.add(host)
+path.write_text("".join(f"{item}\n" for item in sorted(existing)), encoding="utf-8")
+PY
+
+  echo "allowed $host"
+}
+
+deny_host() {
+  ensure_state
+  local host
+  host="$(normalize_host "${1:-}")" || fail "invalid hostname"
+
+  python3 - "$(allowed_hosts_file)" "$host" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+host = sys.argv[2]
+existing = [
+    line.strip().lower()
+    for line in path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+path.write_text(
+    "".join(f"{item}\n" for item in sorted(set(existing) - {host})),
+    encoding="utf-8",
+)
+PY
+
+  echo "denied $host"
+}
+
+proxy_host_for_runtime() {
+  if [[ -n "${COPILOT_BOX_PROXY_HOST:-}" ]]; then
+    echo "$COPILOT_BOX_PROXY_HOST"
+    return
+  fi
+
+  if [[ -n "${LLM_BOX_PROXY_HOST:-}" ]]; then
+    echo "$LLM_BOX_PROXY_HOST"
+    return
+  fi
+
+  if [[ "$(detect_runtime)" == "podman" ]]; then
+    echo "host.containers.internal"
+  else
+    echo "host.docker.internal"
+  fi
+}
+
+wait_for_proxy_ready() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+
+pid = int(sys.argv[1])
+ready_file = Path(sys.argv[2])
+deadline = time.monotonic() + 10.0
+
+while time.monotonic() < deadline:
+    if ready_file.exists():
+        try:
+            payload = json.loads(ready_file.read_text(encoding="utf-8"))
+            port = int(payload["listen_port"])
+        except (json.JSONDecodeError, KeyError, ValueError):
+            port = None
+        else:
+            with socket.socket() as sock:
+                sock.settimeout(0.2)
+                if sock.connect_ex(("127.0.0.1", port)) == 0:
+                    print(port)
+                    raise SystemExit(0)
+
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        break
+
+    time.sleep(0.1)
+
+raise SystemExit(1)
+PY
+}
+
+start_proxy() {
+  ensure_state
+  local workspace ready_file
+  workspace="$(project_dir)"
+  ready_file="$(proxy_ready_file)"
+  rm -f "$ready_file"
+
+  python3 "$SCRIPT_DIR/box_proxy.py" \
+    --listen-host 127.0.0.1 \
+    --listen-port 0 \
+    --allowed-hosts-file "$(allowed_hosts_file)" \
+    --pending-log-file "$(pending_log_file)" \
+    --workspace "$workspace" \
+    --ready-file "$ready_file" \
+    >"$(proxy_log_file)" 2>&1 &
+
+  PROXY_PID=$!
+  PROXY_PORT="$(wait_for_proxy_ready "$PROXY_PID" "$ready_file")" \
+    || fail "egress proxy failed to become ready; see $(proxy_log_file)"
+}
+
+cleanup_proxy() {
+  rm -f "$(proxy_ready_file)"
+  if [[ -n "${PROXY_PID:-}" ]] && kill -0 "$PROXY_PID" >/dev/null 2>&1; then
+    kill "$PROXY_PID"
+    wait "$PROXY_PID" 2>/dev/null || true
+  fi
+}
+
+build_image() {
+  local runtime
+  runtime="$(detect_runtime)"
+  "$runtime" build -t "$IMAGE_NAME" "$SCRIPT_DIR"
+}
+
+run_copilot() {
+  ensure_state
+  local runtime proxy_host current_project_dir
+  runtime="$(detect_runtime)"
+  proxy_host="$(proxy_host_for_runtime)"
+  current_project_dir="$(project_dir)"
+  save_session_meta "$@"
+  start_proxy
+  trap cleanup_proxy EXIT
+
+  local -a tty_args=()
+  if [[ -t 0 && -t 1 ]]; then
+    tty_args=(-it)
+  else
+    tty_args=(-i)
+  fi
+
+  local -a host_args=()
+  if [[ "$runtime" == "docker" && "$(uname -s)" == "Linux" ]]; then
+    host_args=(--add-host=host.docker.internal:host-gateway)
+  fi
+
+  local -a run_args=("${tty_args[@]}" --rm)
+  if [[ ${#host_args[@]} -gt 0 ]]; then
+    run_args+=("${host_args[@]}")
+  fi
+
+  run_args+=(
+    --user "$(id -u):$(id -g)"
+    --workdir /workspace
+    --network=bridge
+    --cap-drop=ALL
+    --security-opt=no-new-privileges
+    -e HOME=/home/copilot
+    -e "GH_TOKEN=${GH_TOKEN:-}"
+    -e "GITHUB_TOKEN=${GITHUB_TOKEN:-}"
+    -e "HTTP_PROXY=http://${proxy_host}:${PROXY_PORT}"
+    -e "HTTPS_PROXY=http://${proxy_host}:${PROXY_PORT}"
+    -e "ALL_PROXY=http://${proxy_host}:${PROXY_PORT}"
+    -e "http_proxy=http://${proxy_host}:${PROXY_PORT}"
+    -e "https_proxy=http://${proxy_host}:${PROXY_PORT}"
+    -e "all_proxy=http://${proxy_host}:${PROXY_PORT}"
+    -e NO_PROXY=localhost,127.0.0.1
+    -e no_proxy=localhost,127.0.0.1
+    -v "$CONTAINER_HOME":/home/copilot
+    -v "$current_project_dir":/workspace
+    "$IMAGE_NAME"
+  )
+
+  "$runtime" run "${run_args[@]}" "$@"
+}
+
+main() {
+  local command="${1:-}"
+
+  case "$command" in
+    -h|--help|help)
+      usage
+      ;;
+    build)
+      shift
+      build_image "$@"
+      ;;
+    pending)
+      shift
+      show_pending "$@"
+      ;;
+    allowed)
+      shift
+      show_allowed "$@"
+      ;;
+    allow)
+      shift
+      [[ $# -eq 1 ]] || fail "usage: copilot-box allow <hostname>"
+      allow_host "$1"
+      ;;
+    deny)
+      shift
+      [[ $# -eq 1 ]] || fail "usage: copilot-box deny <hostname>"
+      deny_host "$1"
+      ;;
+    *)
+      run_copilot "$@"
+      ;;
+  esac
+}
+
+main "$@"

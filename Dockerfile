@@ -1,12 +1,16 @@
 FROM node:22-slim
 
-RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
-RUN npm install -g @anthropic-ai/claude-code
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl git openssh-client \
+  && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -s /bin/bash claude
-USER claude
+RUN npm install -g @github/copilot
 
-RUN mkdir -p /home/claude/.claude /home/claude/.config/gcloud
+RUN useradd -m -s /bin/bash copilot
+USER copilot
+
+ENV HOME=/home/copilot
+RUN mkdir -p /home/copilot/.copilot /home/copilot/.local/state/copilot-box
 WORKDIR /workspace
 
-ENTRYPOINT ["claude"]
+ENTRYPOINT ["copilot"]
