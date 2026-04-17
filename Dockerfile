@@ -10,7 +10,7 @@ RUN useradd -m -s /bin/bash copilot
 USER copilot
 
 ENV HOME=/home/copilot
-RUN mkdir -p /home/copilot/.copilot /home/copilot/.local/state/copilot-box
+RUN mkdir -p /home/copilot/.copilot /home/copilot/.local/state/llm-box
 WORKDIR /workspace
 
 ENTRYPOINT ["copilot"]

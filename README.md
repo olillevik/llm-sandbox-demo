@@ -1,71 +1,90 @@
-# `copilot-box`: GitHub Copilot CLI in a controlled container
+# `llm-box`: boxed LLM CLIs with live approvals
 
-`copilot-box` is a thin wrapper around the GitHub Copilot CLI that keeps the Copilot experience familiar while adding container isolation and operator-controlled networking.
+`llm-box` is a host-side control plane for running assistant CLIs inside a container while keeping outbound access visible and operator-approved.
 
-## What changed
-
-This repository is now intentionally **GitHub Copilot-specific**:
-
-- one container image
-- one launcher: `./copilot-box`
-- one auth/session home inside the container
-- static inbound policy: no published ports
-- dynamic outbound approvals through a host-side proxy
-
-The wrapper is designed to feel Copilot-like. Anything that is not a `copilot-box` policy command is passed straight through to `copilot`, so flows such as:
+Today the built-in provider preset is `copilot`, so the primary flow is:
 
 ```bash
-./copilot-box
-./copilot-box --resume <session-id>
-./copilot-box --experimental
+./llm-box copilot
+./llm-box copilot --resume <session-id>
+./llm-box copilot --experimental
 ```
 
-stay close to the normal Copilot CLI mental model.
+Anything after `copilot` is passed through to the real `copilot` command inside the container.
+
+## What it does
+
+- runs the assistant CLI in a container
+- keeps auth and session state outside the container
+- sends HTTP and HTTPS traffic through a host-side approval proxy
+- records blocked destinations per session
+- lets you approve hosts live without restarting the running session in the common case
+
+## User experience
+
+When `./llm-box copilot` is launched interactively, `llm-box` keeps the provider in your terminal and opens a local browser companion for that session.
+
+The browser companion shows:
+
+- **Pending** blocked hosts for the active session
+- **Allowed** hosts for the active session
+- a **Dismiss** action to hide a blocked host until it appears again
+
+You can also reopen the browser companion for the latest session in the current workspace:
+
+```bash
+./llm-box ui
+```
 
 ## How it works
 
 ### Runtime
 
-The image installs `@github/copilot` and runs `copilot` as the container entrypoint.
+The current image installs `@github/copilot` and uses `copilot` as the container entrypoint.
 
 ### Session persistence
 
-Copilot state is stored outside the container at:
+Container home state is stored at:
 
 ```bash
-~/.copilot-box/container-home
+~/.llm-box/container-home
 ```
 
-That means auth and Copilot-managed session data survive container restarts, and the container always gets a writable home directory.
+That means auth and provider-managed session data survive container restarts.
 
 ### Egress control
 
-All HTTP and HTTPS traffic is sent through a local proxy started by `./copilot-box`.
+All HTTP and HTTPS traffic goes through a local proxy started by `llm-box`.
 
 The proxy:
 
-- allows a small default set of GitHub/Copilot hosts
-- logs blocked destinations to per-project state
+- allows a small default set of GitHub and Copilot hosts
+- logs blocked destinations to per-session state
 - reloads the allowlist on every request
 
-That last point is what makes live approval work: approving a hostname updates the file the proxy reads, so the running session can continue without restarting in the common case.
-
-Per-project policy state lives under:
+Session state lives under:
 
 ```bash
-~/.copilot-box/projects/<workspace-hash>/
+~/.llm-box/sessions/<session-id>/
 ```
 
 Important files:
 
-- `allowed-hosts.txt` — persistent allowlist for that workspace
+- `allowed-hosts.txt` — allowlist for that session
 - `pending.jsonl` — blocked outbound attempts
+- `dismissed.json` — dismissed blocked hosts until they reappear
 - `proxy.log` — proxy stderr/stdout
-- `session-meta.json` — wrapper-level metadata about the last launch
+- `session-meta.json` — metadata about the session
+
+Workspace links to the latest local session live under:
+
+```bash
+~/.llm-box/workspaces/<workspace-hash>/
+```
 
 ### Ingress control
 
-Ingress is intentionally simple and static:
+Ingress stays intentionally simple:
 
 - the container runs with bridge networking
 - no ports are published
@@ -74,15 +93,17 @@ Ingress is intentionally simple and static:
 ## Requirements
 
 - `docker` or `podman`
-- `python3`
-- `node` only for building the image locally if you want to inspect or extend it; it is not required by the wrapper itself
+- Rust and Cargo for running the wrapper from this repository
+- a local browser for the companion UI during interactive use
 
-`./copilot-box` auto-detects `docker` first and falls back to `podman`.
+`llm-box` auto-detects `docker` first and falls back to `podman`.
 
 ## Build
 
+Build the provider image:
+
 ```bash
-./copilot-box build
+./llm-box build
 ```
 
 ## Usage
@@ -90,65 +111,80 @@ Ingress is intentionally simple and static:
 Start Copilot in the current directory:
 
 ```bash
-./copilot-box
+./llm-box copilot
 ```
 
-Resume a Copilot session:
+See blocked outbound destinations for the latest session in the current workspace:
 
 ```bash
-./copilot-box --resume <session-id>
+./llm-box pending
 ```
 
-See blocked outbound destinations for the current workspace:
+See the current allowlist for the latest session:
 
 ```bash
-./copilot-box pending
+./llm-box allowed
 ```
 
-See the current allowlist:
+See your user-managed defaults for future sessions:
 
 ```bash
-./copilot-box allowed
+./llm-box defaults list
 ```
 
-Approve a destination for future and current requests:
+Approve a destination for the latest session:
 
 ```bash
-./copilot-box allow objects-origin.githubusercontent.com
+./llm-box allow objects-origin.githubusercontent.com
 ```
 
-Remove an approved destination:
+Remove an approved destination from the latest session:
 
 ```bash
-./copilot-box deny objects-origin.githubusercontent.com
+./llm-box deny objects-origin.githubusercontent.com
+```
+
+`deny` removes the host from the active session allowlist and tears down active proxy tunnels for that host, so new traffic must be re-approved.
+
+Dismiss a blocked destination from the latest session until it reappears:
+
+```bash
+./llm-box dismiss objects-origin.githubusercontent.com
 ```
 
 If you prefer token-based auth, `GH_TOKEN` or `GITHUB_TOKEN` is passed through into the container. Otherwise, log in inside Copilot with `/login`.
 
 ## Default allowed hosts
 
-The initial workspace allowlist contains:
+Each new session starts with this intentionally narrow built-in default allowlist:
 
 - `api.github.com`
-- `api.githubcopilot.com`
-- `codeload.github.com`
-- `github.com`
-- `githubcopilot.com`
-- `objects.githubusercontent.com`
-- `raw.githubusercontent.com`
-- `uploads.github.com`
+- `api.business.githubcopilot.com`
 
-If Copilot or your workflow needs something else, it will show up via `./copilot-box pending`.
+You can also add your own defaults for future sessions:
+
+```bash
+./llm-box defaults add github.com
+./llm-box defaults remove github.com
+```
+
+User-managed defaults are stored in:
+
+```bash
+~/.llm-box/default-allowed-hosts.txt
+```
+
+They are merged into the built-in defaults when a new session is created. Existing sessions keep their current allowlist.
+
+If Copilot needs anything beyond the built-in baseline, it will show up in `./llm-box pending` and you can decide whether to allow it for just that session or add it as a user default.
+
+If Copilot or your workflow needs something else, it will show up via `./llm-box pending`.
 
 ## Caveats
 
-This implementation is intentionally simple and practical:
-
-- live approvals are implemented for HTTP/HTTPS traffic mediated by the proxy
+- live approvals currently cover HTTP and HTTPS traffic mediated by the proxy
 - non-HTTP protocols are not yet mediated by the same approval path
-- proxy-based control is strong for visibility and ergonomics, but it is not the same thing as a full host firewall
-
-If you later want stricter enforcement, the next step is to combine this with runtime-specific firewalling or a dedicated network namespace policy layer.
+- proxy-based control is useful and visible, but it is not a full host firewall
 
 ## Tests
 
@@ -160,11 +196,12 @@ There is a lightweight automated test script at:
 
 It covers:
 
-- booting the real `copilot-box` image
-- allowlist persistence through `copilot-box allow` and `copilot-box deny`
-- a live approval flow where a running container is blocked, the host approves the destination, and the same running session succeeds without restart
+- booting the real `llm-box` image
+- user-managed defaults being inherited by new sessions, but not retroactively changing existing sessions
+- allowlist persistence through `llm-box allow` and `llm-box deny`
+- a live approval flow where a running session is blocked, the host approves the destination, and the same running session succeeds without restart
 
-These tests are intentionally **offline**:
+These tests are intentionally offline:
 
 - they do not require Copilot login
 - they do not send inference requests
