@@ -12,6 +12,10 @@ HTTP_LOG="$(mktemp)"
 WORKSPACE_A="$(mktemp -d)"
 WORKSPACE_B="$(mktemp -d)"
 WORKSPACE_C="$(mktemp -d)"
+WORKSPACE_D="$(mktemp -d)"
+WORKSPACE_E="$(mktemp -d)"
+WORKSPACE_F="$(mktemp -d)"
+SHARED_SKILLS_DIR="$(mktemp -d)"
 BINARY="$ROOT_DIR/target/debug/llm-box"
 
 find_free_port() {
@@ -20,6 +24,10 @@ find_free_port() {
 
 latest_session_dir() {
   ./llm-box __test-latest-session-dir "$1" "$2"
+}
+
+workspace_home_dir() {
+  ./llm-box __test-workspace-home "$1" "$2"
 }
 
 fail() {
@@ -86,7 +94,7 @@ cleanup() {
   if [[ -n "${RUNTIME:-}" ]]; then
     "$RUNTIME" rmi -f "$TEST_IMAGE" >/dev/null 2>&1 || true
   fi
-  rm -rf "$TEST_HOME" "$HTTP_ROOT" "$WORKSPACE_A" "$WORKSPACE_B" "$WORKSPACE_C"
+  rm -rf "$TEST_HOME" "$HTTP_ROOT" "$WORKSPACE_A" "$WORKSPACE_B" "$WORKSPACE_C" "$WORKSPACE_D" "$WORKSPACE_E" "$WORKSPACE_F" "$SHARED_SKILLS_DIR"
   rm -f "$SESSION_OUT" "$HTTP_LOG"
 }
 
@@ -96,20 +104,59 @@ RUNTIME="$(detect_runtime)"
 export LLM_BOX_RUNTIME="$RUNTIME"
 export LLM_BOX_HOME="$TEST_HOME"
 export LLM_BOX_NO_BROWSER=1
+export LLM_BOX_SHARED_COPILOT_SKILLS_DIR="$SHARED_SKILLS_DIR"
 
 if [[ ! -x "$BINARY" ]]; then
   cargo build >/dev/null
 fi
 
-echo "[1/4] verifying $RUNTIME, the real image, and the real wrapper launch path"
+echo "[1/6] verifying $RUNTIME, the real image, and the real wrapper launch path"
 ensure_runtime_ready
 if ! image_exists llm-box; then
   ./llm-box build >/dev/null
 fi
-"$RUNTIME" run --rm llm-box --help 2>&1 | grep -q "GitHub Copilot CLI" || fail "real llm-box image did not boot"
-./llm-box copilot --version 2>&1 | grep -q "GitHub Copilot CLI" || fail "real llm-box wrapper did not launch the real image"
+IMAGE_HELP="$("$RUNTIME" run --rm llm-box --help 2>&1)"
+echo "$IMAGE_HELP" | grep -q "GitHub Copilot CLI" || fail "real llm-box image did not boot"
+WRAPPER_VERSION_OUTPUT="$(./llm-box copilot --version 2>&1)"
+echo "$WRAPPER_VERSION_OUTPUT" | grep -q "GitHub Copilot CLI" || fail "real llm-box wrapper did not launch the real image"
 
-echo "[2/4] verifying user defaults seed only new sessions"
+echo "[2/6] verifying repo overlay images extend the llm-box base"
+mkdir -p "$WORKSPACE_D/.llm-box"
+cat >"$WORKSPACE_D/.llm-box/Dockerfile" <<'EOF'
+ARG LLM_BOX_BASE_IMAGE
+FROM ${LLM_BOX_BASE_IMAGE}
+ENTRYPOINT ["sh", "-lc", "echo overlay-entrypoint; exec copilot \"$@\"", "--"]
+EOF
+
+(cd "$WORKSPACE_D" && "$BINARY" build >/dev/null)
+OVERLAY_OUTPUT="$(cd "$WORKSPACE_D" && "$BINARY" copilot --version 2>&1)"
+echo "$OVERLAY_OUTPUT" | grep -q "overlay-entrypoint" || fail "repo overlay image was not used"
+
+"$RUNTIME" build -q -t "$TEST_IMAGE" -f - . <<'EOF' >/dev/null
+FROM llm-box
+ENTRYPOINT ["bash", "-lc"]
+EOF
+
+echo "[3/7] verifying shared skills are mounted read-only"
+mkdir -p "$SHARED_SKILLS_DIR/git-commit"
+printf 'shared skill\n' >"$SHARED_SKILLS_DIR/git-commit/SKILL.md"
+(cd "$WORKSPACE_E" && LLM_BOX_IMAGE="$TEST_IMAGE" "$BINARY" copilot 'grep -q "shared skill" "$HOME/.copilot/skills/git-commit/SKILL.md" && ! sh -lc "echo nope > \"$HOME/.copilot/skills/git-commit/SHOULD-NOT-WRITE\"" 2>/dev/null' )
+if [[ -e "$SHARED_SKILLS_DIR/git-commit/SHOULD-NOT-WRITE" ]]; then
+  fail "shared skills mount was unexpectedly writable"
+fi
+
+echo "[4/7] verifying provider home is isolated per workspace"
+(cd "$WORKSPACE_E" && LLM_BOX_IMAGE="$TEST_IMAGE" "$BINARY" copilot 'git config --global user.name workspace-e && git config --global user.email e@example.com')
+(cd "$WORKSPACE_F" && LLM_BOX_IMAGE="$TEST_IMAGE" "$BINARY" copilot 'if [ -f "$HOME/.gitconfig" ]; then ! grep -q workspace-e "$HOME/.gitconfig"; fi && git config --global user.name workspace-f && git config --global user.email f@example.com')
+WORKSPACE_HOME_E="$(workspace_home_dir "$WORKSPACE_E" "$TEST_HOME")"
+WORKSPACE_HOME_F="$(workspace_home_dir "$WORKSPACE_F" "$TEST_HOME")"
+grep -q "workspace-e" "$WORKSPACE_HOME_E/.gitconfig" || fail "workspace E did not persist its own git config in its workspace home"
+grep -q "workspace-f" "$WORKSPACE_HOME_F/.gitconfig" || fail "workspace F did not persist its own git config in its workspace home"
+if grep -q "workspace-e" "$WORKSPACE_HOME_F/.gitconfig"; then
+  fail "workspace F unexpectedly saw workspace E state"
+fi
+
+echo "[5/7] verifying user defaults seed only new sessions"
 (cd "$WORKSPACE_A" && "$BINARY" copilot --version >/dev/null)
 ALLOW_FILE_A="$("$BINARY" __test-latest-session-dir "$WORKSPACE_A" "$TEST_HOME")/allowed-hosts.txt"
 if grep -qx "defaults.example" "$ALLOW_FILE_A"; then
@@ -137,7 +184,7 @@ if grep -qx "defaults.example" "$ALLOW_FILE_C"; then
   fail "removed user default still appeared in a new session"
 fi
 
-echo "[3/4] verifying persistent allowlist behavior"
+echo "[6/7] verifying persistent allowlist behavior"
 ./llm-box copilot --version >/dev/null
 ALLOW_FILE="$(latest_session_dir "$ROOT_DIR" "$TEST_HOME")/allowed-hosts.txt"
 ./llm-box allow example.com >/dev/null
@@ -148,12 +195,7 @@ if ./llm-box allowed | grep -qx "example.com"; then
   fail "example.com remained in the allowlist after deny"
 fi
 
-echo "[4/4] verifying live approval without restarting the session"
-"$RUNTIME" build -q -t "$TEST_IMAGE" -f - . <<'EOF' >/dev/null
-FROM llm-box
-ENTRYPOINT ["bash", "-lc"]
-EOF
-
+echo "[7/7] verifying live approval without restarting the session"
 export LLM_BOX_IMAGE="$TEST_IMAGE"
 HTTP_PORT="$(find_free_port)"
 printf 'ok\n' >"$HTTP_ROOT/index.html"

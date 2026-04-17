@@ -27,6 +27,13 @@ pub(crate) fn latest_session_dir(workspace: &Path, root: &Path) -> Result<PathBu
     Ok(root.join("sessions").join(session_id.trim()))
 }
 
+pub(crate) fn workspace_home_dir(workspace: &Path, root: &Path) -> PathBuf {
+    let workspace = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    root.join("workspaces")
+        .join(workspace_key(&workspace))
+        .join("home")
+}
+
 pub(crate) fn serve_static_command(args: ServeStaticArgs) -> Result<i32> {
     let listener =
         TcpListener::bind((args.listen_host.as_str(), args.listen_port)).with_context(|| {

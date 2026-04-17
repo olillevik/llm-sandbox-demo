@@ -42,15 +42,28 @@ You can also reopen the browser companion for the latest session in the current 
 
 The current image installs `@github/copilot` and uses `copilot` as the container entrypoint.
 
-### Session persistence
+If the current workspace contains `.llm-box/Dockerfile`, `llm-box` builds a repo-specific image on top of the managed base image and runs Copilot in that derived image instead.
 
-Container home state is stored at:
+Use this contract in the repo Dockerfile:
 
-```bash
-~/.llm-box/container-home
+```dockerfile
+ARG LLM_BOX_BASE_IMAGE
+FROM ${LLM_BOX_BASE_IMAGE}
 ```
 
-That means auth and provider-managed session data survive container restarts.
+That lets the repo add tools like `gh`, `ripgrep`, or language toolchains without replacing the base `llm-box` runtime contract.
+
+### Session persistence
+
+Provider home state is stored per workspace at:
+
+```bash
+~/.llm-box/workspaces/<workspace-hash>/home
+```
+
+That means auth, provider settings, and provider-managed session data survive container restarts for that workspace without bleeding into other workspaces.
+
+As a small shared convenience layer, `llm-box` also mounts host Copilot skills from `~/.copilot/skills` into each workspace container as read-only. You can override that source path with `LLM_BOX_SHARED_COPILOT_SKILLS_DIR`.
 
 ### Egress control
 
@@ -76,6 +89,8 @@ Important files:
 - `proxy.log` — proxy stderr/stdout
 - `session-meta.json` — metadata about the session
 
+These approval-session files stay on the host for the `llm-box` control plane; they are not mounted into the provider container.
+
 Workspace links to the latest local session live under:
 
 ```bash
@@ -100,11 +115,13 @@ Ingress stays intentionally simple:
 
 ## Build
 
-Build the provider image:
+Build the provider image for the current workspace:
 
 ```bash
 ./llm-box build
 ```
+
+If `.llm-box/Dockerfile` is present, this builds both the managed base image and the repo-specific derived image.
 
 ## Usage
 
@@ -197,6 +214,8 @@ There is a lightweight automated test script at:
 It covers:
 
 - booting the real `llm-box` image
+- shared Copilot skills mounted read-only into workspace containers
+- provider home isolation between workspaces
 - user-managed defaults being inherited by new sessions, but not retroactively changing existing sessions
 - allowlist persistence through `llm-box allow` and `llm-box deny`
 - a live approval flow where a running session is blocked, the host approves the destination, and the same running session succeeds without restart

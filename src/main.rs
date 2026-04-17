@@ -18,6 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_ALLOWED_HOSTS: &[&str] = &["api.github.com", "api.business.githubcopilot.com"];
+const REPO_OVERLAY_DOCKERFILE: &str = ".llm-box/Dockerfile";
+const REPO_OVERLAY_BASE_IMAGE_ARG: &str = "LLM_BOX_BASE_IMAGE";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -60,6 +62,8 @@ enum Commands {
     TestFreePort,
     #[command(hide = true, name = "__test-latest-session-dir")]
     TestLatestSessionDir(TestLatestSessionDirArgs),
+    #[command(hide = true, name = "__test-workspace-home")]
+    TestWorkspaceHome(TestLatestSessionDirArgs),
     #[command(hide = true, name = "__serve-static")]
     ServeStatic(ServeStaticArgs),
 }
@@ -245,6 +249,13 @@ fn try_main() -> Result<i32> {
             );
             Ok(0)
         }
+        Commands::TestWorkspaceHome(args) => {
+            println!(
+                "{}",
+                test_support::workspace_home_dir(&args.workspace, &args.root).display()
+            );
+            Ok(0)
+        }
         Commands::ServeStatic(args) => test_support::serve_static_command(args),
     }
 }
@@ -259,9 +270,10 @@ fn run_provider_entry(
 
 fn run_provider_direct(config: &AppConfig, provider: ProviderKind, args: &[String]) -> Result<i32> {
     let workspace = env::current_dir().context("failed to resolve current directory")?;
-    let session = SessionContext::new_session(config, workspace, provider, args)?;
     let runtime = detect_runtime()?;
     ensure_runtime_ready(&runtime)?;
+    let image_name = ensure_provider_image(config, &runtime, &workspace)?;
+    let session = SessionContext::new_session(config, workspace, provider, args)?;
     let proxy_host = proxy_host_for_runtime(&runtime);
     let proxy = ProxyProcess::start(&session)?;
     let ui = BrowserUiProcess::maybe_start(&session)?;
@@ -316,12 +328,18 @@ fn run_provider_direct(config: &AppConfig, provider: ProviderKind, args: &[Strin
     command.arg("-e").arg("no_proxy=localhost,127.0.0.1");
     command.arg("-v").arg(format!(
         "{}:/home/copilot",
-        session.container_home.display()
+        session.workspace_home.display()
     ));
+    if let Some(shared_skills_dir) = &config.shared_copilot_skills_dir {
+        command.arg("-v").arg(format!(
+            "{}:/home/copilot/.copilot/skills:ro",
+            shared_skills_dir.display()
+        ));
+    }
     command
         .arg("-v")
         .arg(format!("{}:/workspace", session.workspace.display()));
-    command.arg(&config.image_name);
+    command.arg(&image_name);
     for arg in args {
         command.arg(arg);
     }
@@ -337,8 +355,37 @@ fn run_provider_direct(config: &AppConfig, provider: ProviderKind, args: &[Strin
 }
 
 fn build_image(config: &AppConfig) -> Result<()> {
+    let workspace = env::current_dir().context("failed to resolve current directory")?;
     let runtime = detect_runtime()?;
     ensure_runtime_ready(&runtime)?;
+    build_provider_image(config, &runtime, &workspace).map(|_| ())
+}
+
+fn ensure_provider_image(config: &AppConfig, runtime: &str, workspace: &Path) -> Result<String> {
+    if !image_exists(runtime, &config.image_name)? {
+        build_base_image(config, runtime)?;
+    }
+    if let Some(dockerfile) = repo_overlay_dockerfile(workspace)? {
+        let image_name = repo_overlay_image_name(workspace);
+        build_repo_overlay_image(config, runtime, workspace, &dockerfile, &image_name)?;
+        Ok(image_name)
+    } else {
+        Ok(config.image_name.clone())
+    }
+}
+
+fn build_provider_image(config: &AppConfig, runtime: &str, workspace: &Path) -> Result<String> {
+    build_base_image(config, runtime)?;
+    if let Some(dockerfile) = repo_overlay_dockerfile(workspace)? {
+        let image_name = repo_overlay_image_name(workspace);
+        build_repo_overlay_image(config, runtime, workspace, &dockerfile, &image_name)?;
+        Ok(image_name)
+    } else {
+        Ok(config.image_name.clone())
+    }
+}
+
+fn build_base_image(config: &AppConfig, runtime: &str) -> Result<()> {
     run_status(
         Command::new(runtime).args([
             "build",
@@ -348,6 +395,66 @@ fn build_image(config: &AppConfig) -> Result<()> {
         ]),
         "failed to build container image",
     )
+}
+
+fn build_repo_overlay_image(
+    config: &AppConfig,
+    runtime: &str,
+    workspace: &Path,
+    dockerfile: &Path,
+    image_name: &str,
+) -> Result<()> {
+    let workspace = fs::canonicalize(workspace)
+        .with_context(|| format!("failed to canonicalize {}", workspace.display()))?;
+    let mut command = Command::new(runtime);
+    command
+        .arg("build")
+        .arg("-t")
+        .arg(image_name)
+        .arg("-f")
+        .arg(dockerfile)
+        .arg("--build-arg")
+        .arg(format!(
+            "{REPO_OVERLAY_BASE_IMAGE_ARG}={}",
+            config.image_name
+        ))
+        .arg(&workspace);
+    run_status(
+        &mut command,
+        &format!(
+            "failed to build repo overlay image from {}",
+            dockerfile.display()
+        ),
+    )
+}
+
+fn repo_overlay_dockerfile(workspace: &Path) -> Result<Option<PathBuf>> {
+    let path = workspace.join(REPO_OVERLAY_DOCKERFILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    if !path.is_file() {
+        bail!(
+            "repo overlay path exists but is not a file: {}",
+            path.display()
+        );
+    }
+    Ok(Some(path))
+}
+
+fn repo_overlay_image_name(workspace: &Path) -> String {
+    let workspace = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    format!("llm-box-workspace-{}", workspace_key(&workspace))
+}
+
+fn image_exists(runtime: &str, image_name: &str) -> Result<bool> {
+    let status = Command::new(runtime)
+        .args(["image", "inspect", image_name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to inspect image `{image_name}`"))?;
+    Ok(status.success())
 }
 
 fn resolve_session_for_current_workspace(
@@ -462,7 +569,7 @@ struct AppConfig {
     config_root: PathBuf,
     workspaces_root: PathBuf,
     sessions_root: PathBuf,
-    container_home: PathBuf,
+    shared_copilot_skills_dir: Option<PathBuf>,
     user_defaults_file: PathBuf,
     image_name: String,
 }
@@ -480,7 +587,7 @@ impl AppConfig {
             config_root: config_root.clone(),
             workspaces_root: config_root.join("workspaces"),
             sessions_root: config_root.join("sessions"),
-            container_home: config_root.join("container-home"),
+            shared_copilot_skills_dir: detect_shared_copilot_skills_dir(&home)?,
             user_defaults_file: config_root.join("default-allowed-hosts.txt"),
             image_name: env::var("LLM_BOX_IMAGE").unwrap_or_else(|_| "llm-box".to_string()),
             repo_root,
@@ -556,13 +663,35 @@ fn detect_repo_root() -> Result<PathBuf> {
     bail!("failed to locate repo root containing Dockerfile and Cargo.toml");
 }
 
+fn detect_shared_copilot_skills_dir(home: &Path) -> Result<Option<PathBuf>> {
+    let path = env::var_os("LLM_BOX_SHARED_COPILOT_SKILLS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".copilot").join("skills"));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let canonical = fs::canonicalize(&path)
+        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+    if !canonical.is_dir() {
+        bail!(
+            "shared Copilot skills path is not a directory: {}",
+            canonical.display()
+        );
+    }
+    Ok(Some(canonical))
+}
+
+fn workspace_home_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join("home")
+}
+
 #[derive(Debug, Clone)]
 struct SessionContext {
     session_id: String,
     workspace: PathBuf,
     workspace_dir: PathBuf,
     session_dir: PathBuf,
-    container_home: PathBuf,
+    workspace_home: PathBuf,
     allowed_hosts_file: PathBuf,
     pending_log_file: PathBuf,
     dismissed_file: PathBuf,
@@ -620,12 +749,13 @@ impl SessionContext {
         session_id: String,
     ) -> Self {
         let session_dir = config.sessions_root.join(&session_id);
+        let workspace_home = workspace_home_path(&workspace_dir);
         Self {
             session_id,
             workspace,
             workspace_dir,
             session_dir: session_dir.clone(),
-            container_home: config.container_home.clone(),
+            workspace_home,
             allowed_hosts_file: session_dir.join("allowed-hosts.txt"),
             pending_log_file: session_dir.join("pending.jsonl"),
             dismissed_file: session_dir.join("dismissed.json"),
@@ -637,9 +767,11 @@ impl SessionContext {
     }
 
     fn ensure(&self, config: &AppConfig) -> Result<()> {
-        fs::create_dir_all(self.container_home.join(".copilot"))
+        fs::create_dir_all(&self.workspace_dir)
+            .with_context(|| format!("failed to create {}", self.workspace_dir.display()))?;
+        fs::create_dir_all(self.workspace_home.join(".copilot"))
             .context("failed to create container auth directory")?;
-        fs::create_dir_all(self.container_home.join(".local/state"))
+        fs::create_dir_all(self.workspace_home.join(".local/state"))
             .context("failed to create container state directory")?;
         fs::create_dir_all(&self.session_dir)
             .with_context(|| format!("failed to create {}", self.session_dir.display()))?;
@@ -1130,6 +1262,60 @@ mod tests {
     }
 
     #[test]
+    fn repo_overlay_dockerfile_is_detected() {
+        let root = unique_test_dir("repo-overlay-dockerfile");
+        let workspace = root.join("workspace");
+        let overlay = workspace.join(REPO_OVERLAY_DOCKERFILE);
+        fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        fs::write(
+            &overlay,
+            "ARG LLM_BOX_BASE_IMAGE\nFROM ${LLM_BOX_BASE_IMAGE}\n",
+        )
+        .unwrap();
+
+        assert_eq!(repo_overlay_dockerfile(&workspace).unwrap(), Some(overlay));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repo_overlay_image_name_is_workspace_specific() {
+        let root = unique_test_dir("repo-overlay-image-name");
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        fs::create_dir_all(&workspace_a).unwrap();
+        fs::create_dir_all(&workspace_b).unwrap();
+
+        let image_a = repo_overlay_image_name(&workspace_a);
+        let image_b = repo_overlay_image_name(&workspace_b);
+
+        assert!(image_a.starts_with("llm-box-workspace-"));
+        assert!(image_b.starts_with("llm-box-workspace-"));
+        assert_ne!(image_a, image_b);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_home_path_lives_under_workspace_dir() {
+        let workspace_dir = PathBuf::from("/tmp/llm-box-workspace");
+        assert_eq!(
+            workspace_home_path(&workspace_dir),
+            workspace_dir.join("home")
+        );
+    }
+
+    #[test]
+    fn detect_shared_copilot_skills_dir_returns_none_when_missing() {
+        let root = unique_test_dir("missing-shared-skills");
+        fs::create_dir_all(&root).unwrap();
+
+        assert!(detect_shared_copilot_skills_dir(&root).unwrap().is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn existing_sessions_are_not_backfilled_by_new_user_defaults() {
         let root = unique_test_dir("existing-session-no-backfill");
         let config = test_config(&root);
@@ -1167,7 +1353,7 @@ mod tests {
             config_root: root.to_path_buf(),
             workspaces_root: root.join("workspaces"),
             sessions_root: root.join("sessions"),
-            container_home: root.join("container-home"),
+            shared_copilot_skills_dir: None,
             user_defaults_file: root.join("default-allowed-hosts.txt"),
             image_name: "llm-box".to_string(),
         }
