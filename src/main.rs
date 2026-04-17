@@ -20,6 +20,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_ALLOWED_HOSTS: &[&str] = &["api.github.com", "api.business.githubcopilot.com"];
 const REPO_OVERLAY_DOCKERFILE: &str = ".llm-box/Dockerfile";
 const REPO_OVERLAY_BASE_IMAGE_ARG: &str = "LLM_BOX_BASE_IMAGE";
+const INIT_IMAGE_TEMPLATE: &str = r#"ARG LLM_BOX_BASE_IMAGE
+FROM ${LLM_BOX_BASE_IMAGE}
+
+USER root
+# RUN apt-get update \
+#   && apt-get install -y --no-install-recommends gh \
+#   && rm -rf /var/lib/apt/lists/*
+USER copilot
+"#;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -35,6 +44,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Build,
+    InitImage,
     Defaults {
         #[command(subcommand)]
         command: DefaultCommands,
@@ -171,6 +181,12 @@ fn try_main() -> Result<i32> {
     match cli.command {
         Commands::Build => {
             build_image(&config)?;
+            Ok(0)
+        }
+        Commands::InitImage => {
+            let workspace = env::current_dir().context("failed to resolve current directory")?;
+            let dockerfile = init_repo_overlay_dockerfile(&workspace)?;
+            println!("{}", dockerfile.display());
             Ok(0)
         }
         Commands::Defaults { command } => match command {
@@ -683,6 +699,22 @@ fn detect_shared_copilot_skills_dir(home: &Path) -> Result<Option<PathBuf>> {
 
 fn workspace_home_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join("home")
+}
+
+fn init_repo_overlay_dockerfile(workspace: &Path) -> Result<PathBuf> {
+    let dockerfile = workspace.join(REPO_OVERLAY_DOCKERFILE);
+    if dockerfile.exists() {
+        bail!(
+            "repo overlay Dockerfile already exists: {}",
+            dockerfile.display()
+        );
+    }
+    let parent = dockerfile
+        .parent()
+        .context("repo overlay Dockerfile path had no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    write_atomic(&dockerfile, INIT_IMAGE_TEMPLATE.as_bytes())?;
+    Ok(dockerfile)
 }
 
 #[derive(Debug, Clone)]
@@ -1292,6 +1324,41 @@ mod tests {
         assert!(image_a.starts_with("llm-box-workspace-"));
         assert!(image_b.starts_with("llm-box-workspace-"));
         assert_ne!(image_a, image_b);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn init_repo_overlay_dockerfile_writes_template() {
+        let root = unique_test_dir("init-repo-overlay");
+        fs::create_dir_all(&root).unwrap();
+
+        let dockerfile = init_repo_overlay_dockerfile(&root).unwrap();
+
+        assert_eq!(dockerfile, root.join(REPO_OVERLAY_DOCKERFILE));
+        assert_eq!(
+            fs::read_to_string(&dockerfile).unwrap(),
+            INIT_IMAGE_TEMPLATE
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn init_repo_overlay_dockerfile_does_not_overwrite_existing_file() {
+        let root = unique_test_dir("init-repo-overlay-existing");
+        let dockerfile = root.join(REPO_OVERLAY_DOCKERFILE);
+        fs::create_dir_all(dockerfile.parent().unwrap()).unwrap();
+        fs::write(&dockerfile, "existing\n").unwrap();
+
+        let error = init_repo_overlay_dockerfile(&root).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("repo overlay Dockerfile already exists")
+        );
+        assert_eq!(fs::read_to_string(&dockerfile).unwrap(), "existing\n");
 
         let _ = fs::remove_dir_all(root);
     }

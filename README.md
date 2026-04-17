@@ -123,12 +123,26 @@ Build the provider image for the current workspace:
 
 If `.llm-box/Dockerfile` is present, this builds both the managed base image and the repo-specific derived image.
 
+Scaffold a repo-local overlay Dockerfile:
+
+```bash
+./llm-box init-image
+```
+
+That creates `.llm-box/Dockerfile` with a starter template that extends the managed base image.
+
 ## Usage
 
 Start Copilot in the current directory:
 
 ```bash
 ./llm-box copilot
+```
+
+Create a starter overlay Dockerfile in the current repo:
+
+```bash
+./llm-box init-image
 ```
 
 See blocked outbound destinations for the latest session in the current workspace:
@@ -214,6 +228,7 @@ There is a lightweight automated test script at:
 It covers:
 
 - booting the real `llm-box` image
+- scaffolding a repo-local overlay Dockerfile with `llm-box init-image`
 - shared Copilot skills mounted read-only into workspace containers
 - provider home isolation between workspaces
 - user-managed defaults being inherited by new sessions, but not retroactively changing existing sessions
