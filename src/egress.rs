@@ -233,6 +233,16 @@ pub(crate) fn ensure_connector_mapping(
     Ok(mapping)
 }
 
+pub(crate) fn remove_connector_mapping(
+    mappings: &mut Vec<ConnectorMapping>,
+    target: &EgressTarget,
+) -> bool {
+    let before = mappings.len();
+    mappings.retain(|mapping| mapping.target != *target);
+    sort_and_dedup_connector_mappings(mappings);
+    mappings.len() != before
+}
+
 pub(crate) fn serialize_connector_mappings(mappings: &[ConnectorMapping]) -> Result<Vec<u8>> {
     let mut normalized = mappings.to_vec();
     sort_and_dedup_connector_mappings(&mut normalized);

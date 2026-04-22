@@ -274,6 +274,7 @@ grep -q "^ok$" "$CONNECTOR_OUT" || fail "running connector session did not succe
 assert_allowed_contains "tcp://127.0.0.1:${HTTP_PORT}"
 wait_for_pending_clear "tcp://127.0.0.1:${HTTP_PORT}" \
   || fail "approved connector destination still appears in pending output"
+CONNECTOR_ENDPOINT="$(./llm-box endpoint "tcp://127.0.0.1:${HTTP_PORT}" | cut -f2)"
 
 echo "[10/12] verifying connector traffic is denied again after revoke"
 : >"$CONNECTOR_OUT"
@@ -281,6 +282,13 @@ echo "[10/12] verifying connector traffic is denied again after revoke"
 assert_allowed_absent "tcp://127.0.0.1:${HTTP_PORT}"
 wait_for_pending_clear "tcp://127.0.0.1:${HTTP_PORT}" \
   || fail "revoked connector destination reappeared in pending before a new blocked attempt"
+OLD_CONNECTOR_URL="http://${CONNECTOR_ENDPOINT}/"
+ATTEMPTS=0
+until ! curl --noproxy "*" -fsS "$OLD_CONNECTOR_URL" >/dev/null 2>&1; do
+  ATTEMPTS=$((ATTEMPTS + 1))
+  [ "$ATTEMPTS" -ge 20 ] && fail "revoked connector endpoint remained live after deny"
+  sleep 0.2
+done
 ./llm-box copilot 'CONNECTOR_ENDPOINT="$(llm-box endpoint "tcp://127.0.0.1:'"${HTTP_PORT}"'" | cut -f2)"; sleep 1; ! curl --noproxy "*" -fsS "http://${CONNECTOR_ENDPOINT}/" >/dev/null' >"$CONNECTOR_OUT" 2>&1
 wait_for_pending_target "tcp://127.0.0.1:${HTTP_PORT}" \
   || fail "revoked connector destination did not reappear in pending output"

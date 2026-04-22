@@ -2,7 +2,8 @@ use crate::config::AppConfig;
 use crate::egress::{
     AllowedItem, ConnectorMapping, EgressTarget, PendingItem, PendingLogEntry,
     ensure_connector_mapping, parse_target_spec, read_allowed_targets_file,
-    read_connector_mappings_file, serialize_connector_mappings, serialize_target_set,
+    read_connector_mappings_file, remove_connector_mapping, serialize_connector_mappings,
+    serialize_target_set,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -12,7 +13,7 @@ use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,7 +39,17 @@ pub(crate) struct SessionContext {
     store: SessionStore,
     broker_log_file: PathBuf,
     broker_ready_file: PathBuf,
-    ui_ready_file: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct ActiveSessionLease {
+    active_process_file: PathBuf,
+}
+
+impl Drop for ActiveSessionLease {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.active_process_file);
+    }
 }
 
 impl SessionContext {
@@ -102,7 +113,6 @@ impl SessionContext {
             store,
             broker_log_file: session_dir.join("broker.log"),
             broker_ready_file: session_dir.join("broker-ready.json"),
-            ui_ready_file: session_dir.join("ui-ready.json"),
         }
     }
 
@@ -140,10 +150,6 @@ impl SessionContext {
         &self.broker_ready_file
     }
 
-    pub(crate) fn ui_ready_file(&self) -> &Path {
-        &self.ui_ready_file
-    }
-
     #[cfg(test)]
     pub(crate) fn store(&self) -> &SessionStore {
         &self.store
@@ -178,6 +184,10 @@ impl SessionContext {
         self.store.ensure_connector_endpoint(target)
     }
 
+    pub(crate) fn mark_active(&self) -> Result<ActiveSessionLease> {
+        self.store.mark_active()
+    }
+
     fn save_session_meta(&self, args: &[String]) -> Result<()> {
         self.store.write_session_meta(&SessionMeta {
             session_id: self.session_id.clone(),
@@ -197,6 +207,7 @@ pub(crate) struct SessionStore {
     pending_events_file: PathBuf,
     dismissed_file: PathBuf,
     session_meta_file: PathBuf,
+    active_process_file: PathBuf,
 }
 
 impl SessionStore {
@@ -207,6 +218,7 @@ impl SessionStore {
             pending_events_file: session_dir.join("pending-events.jsonl"),
             dismissed_file: session_dir.join("dismissed.json"),
             session_meta_file: session_dir.join("session-meta.json"),
+            active_process_file: session_dir.join("active-process.json"),
             session_dir,
         }
     }
@@ -228,6 +240,11 @@ impl SessionStore {
     #[cfg(test)]
     pub(crate) fn connectors_file(&self) -> &Path {
         &self.connectors_file
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_process_file(&self) -> &Path {
+        &self.active_process_file
     }
 
     pub(crate) fn initialize(&self, config: &AppConfig) -> Result<()> {
@@ -271,6 +288,34 @@ impl SessionStore {
             pending: self.pending_items()?,
             allowed: self.allowed_items()?,
         })
+    }
+
+    pub(crate) fn is_active_session(&self) -> Result<bool> {
+        if !self.active_process_file.exists() {
+            return Ok(false);
+        }
+        let raw = match fs::read_to_string(&self.active_process_file) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read {}", self.active_process_file.display())
+                });
+            }
+        };
+        let info: ActiveProcessInfo = match serde_json::from_str(&raw) {
+            Ok(info) => info,
+            Err(_) => {
+                let _ = fs::remove_file(&self.active_process_file);
+                return Ok(false);
+            }
+        };
+        if process_is_running(info.pid) {
+            Ok(true)
+        } else {
+            let _ = fs::remove_file(&self.active_process_file);
+            Ok(false)
+        }
     }
 
     pub(crate) fn session_meta(&self) -> Result<SessionMeta> {
@@ -368,10 +413,15 @@ impl SessionStore {
 
     pub(crate) fn deny_target(&self, target: &str) -> Result<()> {
         let target = parse_target_spec(target)?;
+        let denied_target = target.clone();
         self.update_allowed_targets(move |targets| {
-            targets.remove(&target);
+            targets.remove(&denied_target);
             Ok(())
-        })
+        })?;
+        if target.uses_connector() {
+            self.remove_connector_for_target(&target)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn dismiss_target(&self, target: &str) -> Result<()> {
@@ -416,6 +466,19 @@ impl SessionStore {
         read_connector_mappings_file(&self.connectors_file)
     }
 
+    fn mark_active(&self) -> Result<ActiveSessionLease> {
+        let payload = ActiveProcessInfo {
+            pid: process::id(),
+            started_epoch: current_epoch_seconds(),
+        };
+        let bytes =
+            serde_json::to_vec_pretty(&payload).context("failed to serialize active process")?;
+        write_atomic(&self.active_process_file, &[bytes, vec![b'\n']].concat())?;
+        Ok(ActiveSessionLease {
+            active_process_file: self.active_process_file.clone(),
+        })
+    }
+
     fn ensure_connector_for_target(&self, target: &EgressTarget) -> Result<ConnectorMapping> {
         with_file_lock(&self.connectors_file, || {
             let mut mappings = self.connector_mappings()?;
@@ -423,6 +486,17 @@ impl SessionStore {
             let bytes = serialize_connector_mappings(&mappings)?;
             write_atomic(&self.connectors_file, &bytes)?;
             Ok(mapping)
+        })
+    }
+
+    fn remove_connector_for_target(&self, target: &EgressTarget) -> Result<()> {
+        with_file_lock(&self.connectors_file, || {
+            let mut mappings = self.connector_mappings()?;
+            if remove_connector_mapping(&mut mappings, target) {
+                let bytes = serialize_connector_mappings(&mappings)?;
+                write_atomic(&self.connectors_file, &bytes)?;
+            }
+            Ok(())
         })
     }
 
@@ -610,6 +684,28 @@ pub(crate) struct SessionMeta {
     pub(crate) provider: String,
     pub(crate) last_started_epoch: u64,
     pub(crate) last_invocation: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ActiveProcessInfo {
+    pid: u32,
+    started_epoch: u64,
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn process_is_running(pid: u32) -> bool {
+    pid == process::id()
 }
 
 #[cfg(test)]
@@ -908,6 +1004,73 @@ mod tests {
         assert_eq!(
             pending_targets(&session),
             vec!["https://pending.example:443"]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_session_tracks_live_wrapper_process() {
+        let root = unique_test_dir("active-session-live");
+        let config = AppConfig::for_tests(&root);
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let session = SessionContext::new_session(&config, workspace, &[]).unwrap();
+
+        {
+            let _lease = session.mark_active().unwrap();
+            assert!(session.store().is_active_session().unwrap());
+        }
+
+        assert!(!session.store().is_active_session().unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_session_ignores_stale_process_markers() {
+        let root = unique_test_dir("active-session-stale");
+        let store = session_store_fixture(&root);
+        fs::write(
+            store.active_process_file(),
+            serde_json::to_vec(&ActiveProcessInfo {
+                pid: 999_999,
+                started_epoch: current_epoch_seconds(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(!store.is_active_session().unwrap());
+        assert!(!store.active_process_file().exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deny_target_removes_connector_mapping() {
+        let root = unique_test_dir("deny-removes-connector");
+        let config = AppConfig::for_tests(&root);
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let session = SessionContext::new_session(&config, workspace, &[]).unwrap();
+
+        session
+            .connector_endpoint("tcp://db.example.internal:5432")
+            .unwrap();
+        assert!(
+            fs::read_to_string(session.store().connectors_file())
+                .unwrap()
+                .contains("db.example.internal")
+        );
+
+        session
+            .deny_target("tcp://db.example.internal:5432")
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(session.store().connectors_file()).unwrap(),
+            "[]\n"
         );
 
         let _ = fs::remove_dir_all(root);

@@ -253,6 +253,21 @@ impl BrokerState {
             .map_err(|_| anyhow::anyhow!("active connector lock poisoned"))?;
         Ok(ports.insert(port))
     }
+
+    fn mark_connector_port_inactive(&self, port: u16) -> Result<()> {
+        let mut ports = self
+            .active_connector_ports
+            .lock()
+            .map_err(|_| anyhow::anyhow!("active connector lock poisoned"))?;
+        ports.remove(&port);
+        Ok(())
+    }
+
+    fn should_run_connector(&self, mapping: &ConnectorMapping) -> Result<bool> {
+        Ok(self.connector_mappings()?.into_iter().any(|existing| {
+            existing.listen_port == mapping.listen_port && existing.target == mapping.target
+        }))
+    }
 }
 
 fn spawn_disallowed_tunnel_reaper(state: Arc<BrokerState>) {
@@ -339,9 +354,25 @@ fn run_connector_listener(state: Arc<BrokerState>, mapping: ConnectorMapping) {
             return;
         }
     };
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(stream) => {
+    if let Err(error) = listener.set_nonblocking(true) {
+        eprintln!(
+            "broker connector nonblocking error for {} on {}: {error}",
+            mapping.target, mapping.listen_port
+        );
+        let _ = state.mark_connector_port_inactive(mapping.listen_port);
+        return;
+    }
+    loop {
+        match state.should_run_connector(&mapping) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => {
+                eprintln!("broker connector reconcile error: {error:#}");
+                break;
+            }
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
                 let state = Arc::clone(&state);
                 let mapping = mapping.clone();
                 thread::spawn(move || {
@@ -350,8 +381,17 @@ fn run_connector_listener(state: Arc<BrokerState>, mapping: ConnectorMapping) {
                     }
                 });
             }
-            Err(error) => eprintln!("broker connector accept error: {error}"),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                eprintln!("broker connector accept error: {error}");
+                break;
+            }
         }
+    }
+    if let Err(error) = state.mark_connector_port_inactive(mapping.listen_port) {
+        eprintln!("broker connector tracking cleanup error: {error:#}");
     }
 }
 

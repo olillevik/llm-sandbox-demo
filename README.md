@@ -24,19 +24,27 @@ Anything after `copilot` is passed through to the real `copilot` command inside 
 
 ## User experience
 
-When `./llm-box copilot` is launched interactively, `llm-box` keeps the provider in your terminal and opens a local browser companion for that session.
+When `./llm-box copilot` is launched interactively, `llm-box` keeps the provider in your terminal and opens or reuses a local browser UI.
 
-The browser companion shows:
+The UI shows:
 
-- **Pending** blocked destinations for the active session
-- **Allowed** destinations for the active session
+- active sessions only
+- stacked labels for pending state, including total **Pending** count and **Unread** count for items you have not looked at yet
+- **Pending** blocked destinations for the selected session
+- **Allowed** destinations for the selected session
 - connector endpoints for approved TCP-style destinations
 - a **Dismiss** action to hide a blocked destination until it appears again
 
-You can also reopen the browser companion for the latest session in the current workspace:
+You can also reopen the UI for the latest session in the current workspace:
 
 ```bash
 ./llm-box ui
+```
+
+Or jump straight to a specific session inside the UI:
+
+```bash
+./llm-box ui --session <session-id>
 ```
 
 ## How it works
@@ -150,6 +158,15 @@ Start Copilot in the current directory:
 
 ```bash
 ./llm-box copilot
+```
+
+`llm-box` opens or reuses the shared UI automatically for interactive sessions.
+
+Open the UI:
+
+```bash
+./llm-box ui
+./llm-box ui --session <session-id>
 ```
 
 Create a starter overlay Dockerfile in the current repo:

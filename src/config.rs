@@ -45,6 +45,14 @@ impl AppConfig {
         &self.workspaces_root
     }
 
+    pub(crate) fn ui_ready_file(&self) -> PathBuf {
+        self.config_root.join("ui-ready.json")
+    }
+
+    pub(crate) fn ui_activity_file(&self) -> PathBuf {
+        self.config_root.join("ui-activity")
+    }
+
     pub(crate) fn sessions_root(&self) -> &Path {
         &self.sessions_root
     }
