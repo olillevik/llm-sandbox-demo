@@ -1,12 +1,25 @@
-use crate::{PendingItem, SessionMeta, SessionUiArgs, UiReady, normalize_host, write_atomic};
+use crate::SessionUiArgs;
+use crate::egress::parse_target_spec;
+use crate::session::{SessionStore, write_atomic};
 use anyhow::{Context, Result};
-use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::thread;
+use std::time::Duration;
+
+const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct UiReady {
+    pub(crate) listen_port: u16,
+}
 
 pub(crate) fn run_session_ui_command(args: SessionUiArgs) -> Result<i32> {
     if let Some(parent) = args.ready_file.parent() {
@@ -49,23 +62,49 @@ pub(crate) fn run_session_ui_command(args: SessionUiArgs) -> Result<i32> {
 }
 
 fn handle_ui_request(mut stream: TcpStream, session_dir: &Path) -> Result<()> {
+    configure_stream(&stream)?;
+    let store = SessionStore::from_dir(session_dir.to_path_buf());
     let clone = stream.try_clone().context("failed to clone ui stream")?;
     let mut reader = BufReader::new(clone);
     let mut request_line = String::new();
     reader
         .read_line(&mut request_line)
         .context("failed to read ui request line")?;
+    if request_line.is_empty() {
+        return write_text(&mut stream, 400, "Bad Request", "invalid request\n");
+    }
+    if request_line.len() > MAX_REQUEST_LINE_BYTES {
+        return write_text(
+            &mut stream,
+            431,
+            "Request Header Fields Too Large",
+            "request line too long\n",
+        );
+    }
     let request_line = request_line.trim_end_matches(['\r', '\n']);
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("/");
 
     let mut content_length = 0usize;
+    let mut header_bytes = 0usize;
     loop {
         let mut line = String::new();
         reader
             .read_line(&mut line)
             .context("failed to read ui header line")?;
+        if line.is_empty() {
+            return write_text(&mut stream, 400, "Bad Request", "invalid request\n");
+        }
+        header_bytes += line.len();
+        if line.len() > MAX_HEADER_LINE_BYTES || header_bytes > MAX_HEADER_BYTES {
+            return write_text(
+                &mut stream,
+                431,
+                "Request Header Fields Too Large",
+                "headers too large\n",
+            );
+        }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
@@ -77,6 +116,9 @@ fn handle_ui_request(mut stream: TcpStream, session_dir: &Path) -> Result<()> {
         }
     }
 
+    if content_length > MAX_REQUEST_BODY_BYTES {
+        return write_text(&mut stream, 413, "Payload Too Large", "payload too large\n");
+    }
     let mut body = vec![0_u8; content_length];
     if content_length > 0 {
         reader
@@ -86,152 +128,41 @@ fn handle_ui_request(mut stream: TcpStream, session_dir: &Path) -> Result<()> {
 
     match (method, target) {
         ("GET", "/") => write_html(&mut stream),
-        ("GET", "/api/state") => write_json(&mut stream, &load_state(session_dir)?),
+        ("GET", "/api/state") => write_json(&mut stream, &store.load_state()?),
         ("POST", "/api/allow") => {
-            let host = parse_host_body(&body)?;
-            mutate_allowed(session_dir, &host, true)?;
-            write_json(&mut stream, &load_state(session_dir)?)
+            handle_target_mutation(&mut stream, &store, &body, SessionStore::allow_target)
         }
         ("POST", "/api/deny") => {
-            let host = parse_host_body(&body)?;
-            mutate_allowed(session_dir, &host, false)?;
-            write_json(&mut stream, &load_state(session_dir)?)
+            handle_target_mutation(&mut stream, &store, &body, SessionStore::deny_target)
         }
         ("POST", "/api/dismiss") => {
-            let host = parse_host_body(&body)?;
-            dismiss_host(session_dir, &host)?;
-            write_json(&mut stream, &load_state(session_dir)?)
+            handle_target_mutation(&mut stream, &store, &body, SessionStore::dismiss_target)
         }
         _ => write_text(&mut stream, 404, "Not Found", "not found\n"),
     }
 }
 
-fn parse_host_body(body: &[u8]) -> Result<String> {
+fn handle_target_mutation(
+    stream: &mut TcpStream,
+    store: &SessionStore,
+    body: &[u8],
+    mutate: impl Fn(&SessionStore, &str) -> Result<()>,
+) -> Result<()> {
+    let target = match parse_target_body(body) {
+        Ok(target) => target,
+        Err(_) => return write_text(stream, 400, "Bad Request", "invalid destination\n"),
+    };
+    mutate(store, &target)?;
+    write_json(stream, &store.load_state()?)
+}
+
+fn parse_target_body(body: &[u8]) -> Result<String> {
     #[derive(serde::Deserialize)]
     struct Body {
-        host: String,
+        target: String,
     }
     let payload: Body = serde_json::from_slice(body).context("failed to parse ui request body")?;
-    normalize_host(&payload.host)
-}
-
-#[derive(Serialize)]
-struct UiState {
-    session: SessionMeta,
-    pending: Vec<PendingItem>,
-    allowed: Vec<String>,
-}
-
-fn load_state(session_dir: &Path) -> Result<UiState> {
-    let session: SessionMeta = serde_json::from_str(
-        &fs::read_to_string(session_dir.join("session-meta.json")).with_context(|| {
-            format!(
-                "failed to read {}",
-                session_dir.join("session-meta.json").display()
-            )
-        })?,
-    )
-    .context("failed to parse session metadata")?;
-
-    let allowed = read_allowed(session_dir)?;
-    let pending = read_pending(session_dir, &allowed, &read_dismissed(session_dir)?)?;
-    Ok(UiState {
-        session,
-        pending,
-        allowed: allowed.into_iter().collect(),
-    })
-}
-
-fn read_allowed(session_dir: &Path) -> Result<Vec<String>> {
-    let contents =
-        fs::read_to_string(session_dir.join("allowed-hosts.txt")).with_context(|| {
-            format!(
-                "failed to read {}",
-                session_dir.join("allowed-hosts.txt").display()
-            )
-        })?;
-    let mut hosts = contents
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(normalize_host)
-        .collect::<Result<Vec<_>>>()?;
-    hosts.sort();
-    hosts.dedup();
-    Ok(hosts)
-}
-
-fn read_dismissed(session_dir: &Path) -> Result<BTreeMap<String, u64>> {
-    let path = session_dir.join("dismissed.json");
-    let raw =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
-}
-
-fn read_pending(
-    session_dir: &Path,
-    allowed: &[String],
-    dismissed: &BTreeMap<String, u64>,
-) -> Result<Vec<PendingItem>> {
-    let allowed = allowed.iter().cloned().collect::<HashSet<_>>();
-    let contents = fs::read_to_string(session_dir.join("pending.jsonl")).with_context(|| {
-        format!(
-            "failed to read {}",
-            session_dir.join("pending.jsonl").display()
-        )
-    })?;
-    let mut latest = BTreeMap::new();
-    for line in contents.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: crate::PendingLogEntry =
-            serde_json::from_str(line).context("failed to parse pending log line")?;
-        let host = normalize_host(&event.host)?;
-        let epoch = event.timestamp.parse::<u64>().unwrap_or(0);
-        latest.insert(
-            host.clone(),
-            PendingItem {
-                host,
-                port: event.port,
-                timestamp: event.timestamp,
-                epoch,
-            },
-        );
-    }
-    let mut items = latest
-        .into_values()
-        .filter(|item| !allowed.contains(&item.host))
-        .filter(|item| dismissed.get(&item.host).copied().unwrap_or(0) < item.epoch)
-        .collect::<Vec<_>>();
-    items.sort_by(|a, b| b.epoch.cmp(&a.epoch).then_with(|| a.host.cmp(&b.host)));
-    Ok(items)
-}
-
-fn mutate_allowed(session_dir: &Path, host: &str, allow: bool) -> Result<()> {
-    let mut hosts = read_allowed(session_dir)?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    if allow {
-        hosts.insert(normalize_host(host)?);
-    } else {
-        hosts.remove(&normalize_host(host)?);
-    }
-    let contents = hosts
-        .into_iter()
-        .map(|item| format!("{item}\n"))
-        .collect::<String>();
-    write_atomic(&session_dir.join("allowed-hosts.txt"), contents.as_bytes())
-}
-
-fn dismiss_host(session_dir: &Path, host: &str) -> Result<()> {
-    let mut dismissed = read_dismissed(session_dir)?;
-    dismissed.insert(normalize_host(host)?, crate::current_epoch_seconds());
-    let bytes =
-        serde_json::to_vec_pretty(&dismissed).context("failed to serialize dismissed state")?;
-    write_atomic(
-        &session_dir.join("dismissed.json"),
-        &[bytes, vec![b'\n']].concat(),
-    )
+    Ok(parse_target_spec(&payload.target)?.to_string())
 }
 
 fn write_html(stream: &mut TcpStream) -> Result<()> {
@@ -282,42 +213,111 @@ fn write_html(stream: &mut TcpStream) -> Result<()> {
   </div>
   <script>
     let lastStateHash = '';
-    async function post(path, host) {
-      await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ host }) });
+    async function post(path, target) {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ target }),
+      });
+      if (!response.ok) {
+        throw new Error(`request failed with ${response.status}`);
+      }
       await refresh();
+    }
+    function makeEmptyState(text) {
+      const el = document.createElement('div');
+      el.className = 'empty';
+      el.textContent = text;
+      return el;
+    }
+    function makeButton(label, className, onClick) {
+      const button = document.createElement('button');
+      if (className) button.className = className;
+      button.textContent = label;
+      button.addEventListener('click', async () => {
+        try {
+          await onClick();
+        } catch (error) {
+          document.getElementById('meta').textContent = `Request failed: ${error.message}`;
+        }
+      });
+      return button;
     }
     function renderPending(items) {
       const el = document.getElementById('pending');
-      if (!items.length) { el.innerHTML = '<div class="empty">No blocked hosts</div>'; return; }
-      el.innerHTML = items.map(item => `
-        <div class="item">
-          <div class="host selectable">${item.port ? item.host + ':' + item.port : item.host}</div>
-          <div class="meta-line selectable">Last seen: ${item.timestamp}</div>
-          <div class="meta-line">
-            <button onclick="post('/api/allow', '${item.host}')">Allow</button>
-            <button class="secondary" onclick="post('/api/dismiss', '${item.host}')">Dismiss</button>
-          </div>
-        </div>
-      `).join('');
+      el.replaceChildren();
+      if (!items.length) { el.appendChild(makeEmptyState('No blocked destinations')); return; }
+      for (const item of items) {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'item';
+
+        const host = document.createElement('div');
+        host.className = 'host selectable';
+        host.textContent = item.target;
+
+        const lastSeen = document.createElement('div');
+        lastSeen.className = 'meta-line selectable';
+        lastSeen.textContent = `Last seen: ${item.last_seen_epoch_nanos}`;
+
+        if (item.connector_endpoint) {
+          const endpoint = document.createElement('div');
+          endpoint.className = 'meta-line selectable';
+          endpoint.textContent = `Connector: ${item.connector_endpoint}`;
+          wrapper.append(endpoint);
+        }
+
+        const actions = document.createElement('div');
+        actions.className = 'meta-line';
+        actions.appendChild(makeButton('Allow', '', () => post('/api/allow', item.target)));
+        actions.appendChild(makeButton('Dismiss', 'secondary', () => post('/api/dismiss', item.target)));
+
+        wrapper.prepend(host, lastSeen);
+        wrapper.append(actions);
+        el.appendChild(wrapper);
+      }
     }
     function renderAllowed(items) {
       const el = document.getElementById('allowed');
-      if (!items.length) { el.innerHTML = '<div class="empty">No approved hosts</div>'; return; }
-      el.innerHTML = `<div class="compact">` + items.map(host => `
-        <div class="item">
-          <div class="inline-row">
-            <div class="host-wrap selectable">
-              <div class="host">${host}</div>
-            </div>
-            <div class="actions">
-              <button class="danger" onclick="post('/api/deny', '${host}')">Deny</button>
-            </div>
-          </div>
-        </div>
-      `).join('') + `</div>`;
+      el.replaceChildren();
+      if (!items.length) { el.appendChild(makeEmptyState('No approved destinations')); return; }
+      const container = document.createElement('div');
+      container.className = 'compact';
+      for (const itemData of items) {
+        const item = document.createElement('div');
+        item.className = 'item';
+
+        const row = document.createElement('div');
+        row.className = 'inline-row';
+
+        const wrap = document.createElement('div');
+        wrap.className = 'host-wrap selectable';
+        const hostEl = document.createElement('div');
+        hostEl.className = 'host';
+        hostEl.textContent = itemData.target;
+        wrap.appendChild(hostEl);
+        if (itemData.connector_endpoint) {
+          const endpointEl = document.createElement('div');
+          endpointEl.className = 'meta-line';
+          endpointEl.textContent = `Connector: ${itemData.connector_endpoint}`;
+          wrap.appendChild(endpointEl);
+        }
+
+        const actions = document.createElement('div');
+        actions.className = 'actions';
+        actions.appendChild(makeButton('Deny', 'danger', () => post('/api/deny', itemData.target)));
+
+        row.append(wrap, actions);
+        item.appendChild(row);
+        container.appendChild(item);
+      }
+      el.appendChild(container);
     }
     async function refresh() {
-      const state = await (await fetch('/api/state')).json();
+      const response = await fetch('/api/state');
+      if (!response.ok) {
+        throw new Error(`refresh failed with ${response.status}`);
+      }
+      const state = await response.json();
       const selection = window.getSelection ? window.getSelection().toString() : '';
       const nextHash = JSON.stringify(state);
       if (selection) return;
@@ -327,8 +327,15 @@ fn write_html(stream: &mut TcpStream) -> Result<()> {
       renderPending(state.pending);
       renderAllowed(state.allowed);
     }
-    refresh();
-    setInterval(refresh, 1000);
+    async function refreshLoop() {
+      try {
+        await refresh();
+      } catch (error) {
+        document.getElementById('meta').textContent = `Refresh failed: ${error.message}`;
+      }
+    }
+    refreshLoop();
+    setInterval(refreshLoop, 1000);
   </script>
 </body>
 </html>"#;
@@ -380,4 +387,13 @@ fn write_response(
     stream
         .write_all(body)
         .context("failed to write ui response body")
+}
+
+fn configure_stream(stream: &TcpStream) -> Result<()> {
+    stream
+        .set_read_timeout(Some(STREAM_IO_TIMEOUT))
+        .context("failed to set ui read timeout")?;
+    stream
+        .set_write_timeout(Some(STREAM_IO_TIMEOUT))
+        .context("failed to set ui write timeout")
 }
