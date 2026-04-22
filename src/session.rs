@@ -862,6 +862,58 @@ mod tests {
     }
 
     #[test]
+    fn session_store_state_machine_requires_new_block_after_allow_or_dismiss() {
+        let root = unique_test_dir("session-state-machine");
+        let config = AppConfig::for_tests(&root);
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let session = SessionContext::new_session(&config, workspace, &[]).unwrap();
+        let store = session.store().clone();
+        let target = "https://pending.example";
+
+        append_pending_event(&store, target, current_epoch_nanos() + 1);
+        assert_eq!(
+            pending_targets(&session),
+            vec!["https://pending.example:443"]
+        );
+
+        session.allow_target(target).unwrap();
+        assert!(pending_targets(&session).is_empty());
+        assert!(
+            session
+                .allowed_target_specs()
+                .unwrap()
+                .contains(&"https://pending.example:443".to_string())
+        );
+
+        session.deny_target(target).unwrap();
+        assert!(pending_targets(&session).is_empty());
+        assert!(
+            !session
+                .allowed_target_specs()
+                .unwrap()
+                .contains(&"https://pending.example:443".to_string())
+        );
+
+        append_pending_event(&store, target, current_epoch_nanos() + 1);
+        assert_eq!(
+            pending_targets(&session),
+            vec!["https://pending.example:443"]
+        );
+
+        session.dismiss_target(target).unwrap();
+        assert!(pending_targets(&session).is_empty());
+
+        append_pending_event(&store, target, current_epoch_nanos() + 1);
+        assert_eq!(
+            pending_targets(&session),
+            vec!["https://pending.example:443"]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn write_atomic_uses_unique_temp_files() {
         let root = unique_test_dir("write-atomic-temp-files");
         fs::create_dir_all(&root).unwrap();
@@ -922,6 +974,28 @@ mod tests {
         let session_dir = root.join("session");
         fs::create_dir_all(&session_dir).unwrap();
         SessionStore::from_dir(session_dir)
+    }
+
+    fn append_pending_event(store: &SessionStore, target: &str, event_epoch_nanos: u64) {
+        let target = parse_target_spec(target).unwrap();
+        let existing = fs::read_to_string(store.pending_events_file()).unwrap_or_default();
+        let event = serde_json::to_string(&PendingLogEntry {
+            event_epoch_nanos: event_epoch_nanos.to_string(),
+            kind: target.kind,
+            host: target.host,
+            port: target.port,
+        })
+        .unwrap();
+        fs::write(store.pending_events_file(), format!("{existing}{event}\n")).unwrap();
+    }
+
+    fn pending_targets(session: &SessionContext) -> Vec<String> {
+        session
+            .pending_items()
+            .unwrap()
+            .into_iter()
+            .map(|item| item.target)
+            .collect()
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {

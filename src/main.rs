@@ -316,73 +316,27 @@ fn run_copilot(config: &AppConfig, args: &[String]) -> Result<i32> {
     let broker = BrokerProcess::start(&runtime, &image_name, &session, &network)?;
     let ui = BrowserUiProcess::maybe_start(&session)?;
 
-    let tty_args = if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        vec!["-it".to_string()]
+    let tty_mode = if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        TtyMode::Interactive
     } else {
-        vec!["-i".to_string()]
+        TtyMode::StdinOnly
     };
-
-    let mut command = Command::new(&runtime);
-    command.arg("run");
-    for arg in tty_args {
-        command.arg(arg);
-    }
-    command.arg("--rm");
 
     let uid = current_command_output("id", ["-u"])?;
     let gid = current_command_output("id", ["-g"])?;
-
-    command.args([
-        "--user",
-        &format!("{uid}:{gid}"),
-        "--workdir",
-        "/workspace",
-        "--network",
-        network.internal_name(),
-        "--cap-drop=ALL",
-        "--security-opt=no-new-privileges",
-        "-e",
-        "HOME=/home/copilot",
-        "-e",
-        &format!("LLM_BOX_SESSION_ID={}", session.session_id()),
-    ]);
-
-    pass_env(&mut command, "GH_TOKEN");
-    pass_env(&mut command, "GITHUB_TOKEN");
-    let proxy_url = format!("http://{BROKER_INTERNAL_HOST}:{BROKER_LISTEN_PORT}");
-    for key in [
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ] {
-        command.arg("-e").arg(format!("{key}={proxy_url}"));
-    }
-    command.arg("-e").arg(format!(
-        "NO_PROXY=localhost,127.0.0.1,{BROKER_INTERNAL_HOST}"
-    ));
-    command.arg("-e").arg(format!(
-        "no_proxy=localhost,127.0.0.1,{BROKER_INTERNAL_HOST}"
-    ));
-    command.arg("-v").arg(format!(
-        "{}:/home/copilot",
-        session.workspace_home().display()
-    ));
-    if let Some(shared_skills_dir) = config.shared_copilot_skills_dir() {
-        command.arg("-v").arg(format!(
-            "{}:/home/copilot/.copilot/skills:ro",
-            shared_skills_dir.display()
-        ));
-    }
-    command
-        .arg("-v")
-        .arg(format!("{}:/workspace", session.workspace().display()));
-    command.arg(&image_name);
-    for arg in args {
-        command.arg(arg);
-    }
+    let passthrough_env = collect_passthrough_env(&["GH_TOKEN", "GITHUB_TOKEN"]);
+    let plan = build_copilot_run_plan(
+        &image_name,
+        &session,
+        &network,
+        &uid,
+        &gid,
+        tty_mode,
+        args,
+        &passthrough_env,
+        config.shared_copilot_skills_dir(),
+    );
+    let mut command = plan.command(&runtime);
 
     let status = command
         .status()
@@ -393,6 +347,162 @@ fn run_copilot(config: &AppConfig, args: &[String]) -> Result<i32> {
     Ok(status
         .code()
         .unwrap_or(if status.success() { 0 } else { 1 }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TtyMode {
+    Interactive,
+    StdinOnly,
+}
+
+impl TtyMode {
+    fn runtime_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Interactive => &["-it"],
+            Self::StdinOnly => &["-i"],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContainerRunPlan {
+    args: Vec<String>,
+}
+
+impl ContainerRunPlan {
+    fn command(&self, runtime: &str) -> Command {
+        let mut command = Command::new(runtime);
+        command.args(&self.args);
+        command
+    }
+}
+
+fn collect_passthrough_env(keys: &[&str]) -> Vec<(String, String)> {
+    keys.iter()
+        .filter_map(|key| {
+            env::var_os(key).map(|value| (key.to_string(), value.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
+fn build_copilot_run_plan(
+    image_name: &str,
+    session: &SessionContext,
+    network: &SessionNetwork,
+    uid: &str,
+    gid: &str,
+    tty_mode: TtyMode,
+    invocation_args: &[String],
+    passthrough_env: &[(String, String)],
+    shared_skills_dir: Option<&Path>,
+) -> ContainerRunPlan {
+    let mut args = vec!["run".to_string()];
+    args.extend(tty_mode.runtime_args().iter().map(|arg| (*arg).to_string()));
+    args.push("--rm".to_string());
+    args.extend([
+        "--user".to_string(),
+        format!("{uid}:{gid}"),
+        "--workdir".to_string(),
+        "/workspace".to_string(),
+        "--network".to_string(),
+        network.internal_name().to_string(),
+        "--cap-drop=ALL".to_string(),
+        "--security-opt=no-new-privileges".to_string(),
+        "-e".to_string(),
+        "HOME=/home/copilot".to_string(),
+        "-e".to_string(),
+        format!("LLM_BOX_SESSION_ID={}", session.session_id()),
+    ]);
+    for (key, value) in passthrough_env {
+        args.push("-e".to_string());
+        args.push(format!("{key}={value}"));
+    }
+    let proxy_url = format!("http://{BROKER_INTERNAL_HOST}:{BROKER_LISTEN_PORT}");
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        args.push("-e".to_string());
+        args.push(format!("{key}={proxy_url}"));
+    }
+    args.push("-e".to_string());
+    args.push(format!(
+        "NO_PROXY=localhost,127.0.0.1,{BROKER_INTERNAL_HOST}"
+    ));
+    args.push("-e".to_string());
+    args.push(format!(
+        "no_proxy=localhost,127.0.0.1,{BROKER_INTERNAL_HOST}"
+    ));
+    args.push("-v".to_string());
+    args.push(format!(
+        "{}:/home/copilot",
+        session.workspace_home().display()
+    ));
+    if let Some(shared_skills_dir) = shared_skills_dir {
+        args.push("-v".to_string());
+        args.push(format!(
+            "{}:/home/copilot/.copilot/skills:ro",
+            shared_skills_dir.display()
+        ));
+    }
+    args.push("-v".to_string());
+    args.push(format!("{}:/workspace", session.workspace().display()));
+    args.push(image_name.to_string());
+    args.extend(invocation_args.iter().cloned());
+    ContainerRunPlan { args }
+}
+
+fn build_broker_run_plan(
+    runtime: &str,
+    image_name: &str,
+    session: &SessionContext,
+    network: &SessionNetwork,
+    loopback_alias: &str,
+    add_host_gateway_alias: bool,
+) -> ContainerRunPlan {
+    let container_name = format!("llm-box-broker-{}", session.session_id());
+    let session_mount = format!("{}:/llm-box/session", session.session_dir().display());
+    let broker_port = BROKER_LISTEN_PORT.to_string();
+    let mut args = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "--name".to_string(),
+        container_name,
+        "--network".to_string(),
+        network.internal_name().to_string(),
+        "--network-alias".to_string(),
+        BROKER_INTERNAL_HOST.to_string(),
+        "-v".to_string(),
+        session_mount,
+        "--entrypoint".to_string(),
+        "llm-box".to_string(),
+    ];
+    if runtime == "docker" && add_host_gateway_alias {
+        args.push("--add-host=host.docker.internal:host-gateway".to_string());
+    }
+    args.extend([
+        image_name.to_string(),
+        "__broker".to_string(),
+        "--listen-host".to_string(),
+        "0.0.0.0".to_string(),
+        "--listen-port".to_string(),
+        broker_port,
+        "--allowed-targets-file".to_string(),
+        "/llm-box/session/allowed-targets.txt".to_string(),
+        "--pending-events-file".to_string(),
+        "/llm-box/session/pending-events.jsonl".to_string(),
+        "--connectors-file".to_string(),
+        "/llm-box/session/connectors.json".to_string(),
+        "--broker-ready-file".to_string(),
+        "/llm-box/session/broker-ready.json".to_string(),
+        "--host-loopback-alias".to_string(),
+        loopback_alias.to_string(),
+    ]);
+    ContainerRunPlan { args }
 }
 
 fn build_image(config: &AppConfig) -> Result<()> {
@@ -575,14 +685,6 @@ fn run_status(command: &mut Command, context: &str) -> Result<()> {
     Ok(())
 }
 
-fn pass_env(command: &mut Command, key: &str) {
-    if let Some(value) = env::var_os(key) {
-        command
-            .arg("-e")
-            .arg(format!("{key}={}", value.to_string_lossy()));
-    }
-}
-
 fn current_command_output<I, S>(program: &str, args: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,
@@ -712,43 +814,16 @@ impl BrokerProcess {
             .try_clone()
             .context("failed to clone broker log handle")?;
         let container_name = format!("llm-box-broker-{}", session.session_id());
-        let session_mount = format!("{}:/llm-box/session", session.session_dir().display());
         let loopback_alias = runtime_host_loopback_alias(runtime);
-        let broker_port = BROKER_LISTEN_PORT.to_string();
-
-        let mut command = Command::new(runtime);
-        command
-            .arg("run")
-            .arg("--rm")
-            .arg("--name")
-            .arg(&container_name)
-            .arg("--network")
-            .arg(network.internal_name())
-            .arg("--network-alias")
-            .arg(BROKER_INTERNAL_HOST)
-            .arg("-v")
-            .arg(session_mount)
-            .arg("--entrypoint")
-            .arg("llm-box");
-        if runtime == "docker" && cfg!(target_os = "linux") {
-            command.arg("--add-host=host.docker.internal:host-gateway");
-        }
-        command.arg(image_name).arg("__broker").args([
-            "--listen-host",
-            "0.0.0.0",
-            "--listen-port",
-            &broker_port,
-            "--allowed-targets-file",
-            "/llm-box/session/allowed-targets.txt",
-            "--pending-events-file",
-            "/llm-box/session/pending-events.jsonl",
-            "--connectors-file",
-            "/llm-box/session/connectors.json",
-            "--broker-ready-file",
-            "/llm-box/session/broker-ready.json",
-            "--host-loopback-alias",
+        let plan = build_broker_run_plan(
+            runtime,
+            image_name,
+            session,
+            network,
             &loopback_alias,
-        ]);
+            cfg!(target_os = "linux"),
+        );
+        let mut command = plan.command(runtime);
         let mut child = command
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_err))
@@ -1086,6 +1161,156 @@ mod tests {
                 .contains("repo overlay Dockerfile already exists")
         );
         assert_eq!(fs::read_to_string(&dockerfile).unwrap(), "existing\n");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copilot_run_plan_captures_security_relevant_runtime_args() {
+        let root = unique_test_dir("copilot-run-plan");
+        let config = AppConfig::for_tests(&root);
+        let workspace = root.join("workspace");
+        let shared_skills = root.join("shared-skills");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&shared_skills).unwrap();
+        let session =
+            SessionContext::new_session(&config, workspace.clone(), &["--resume".to_string()])
+                .unwrap();
+        let network = SessionNetwork {
+            runtime: "podman".to_string(),
+            internal_name: "llm-box-internal-test".to_string(),
+            external_name: "llm-box-external-test".to_string(),
+        };
+        let invocation = vec!["--resume".to_string(), "session-123".to_string()];
+        let passthrough_env = vec![
+            ("GH_TOKEN".to_string(), "gh-token".to_string()),
+            ("GITHUB_TOKEN".to_string(), "github-token".to_string()),
+        ];
+
+        let plan = build_copilot_run_plan(
+            "test-image:latest",
+            &session,
+            &network,
+            "501",
+            "20",
+            TtyMode::Interactive,
+            &invocation,
+            &passthrough_env,
+            Some(shared_skills.as_path()),
+        );
+
+        assert_eq!(
+            plan.args,
+            vec![
+                "run".to_string(),
+                "-it".to_string(),
+                "--rm".to_string(),
+                "--user".to_string(),
+                "501:20".to_string(),
+                "--workdir".to_string(),
+                "/workspace".to_string(),
+                "--network".to_string(),
+                "llm-box-internal-test".to_string(),
+                "--cap-drop=ALL".to_string(),
+                "--security-opt=no-new-privileges".to_string(),
+                "-e".to_string(),
+                "HOME=/home/copilot".to_string(),
+                "-e".to_string(),
+                format!("LLM_BOX_SESSION_ID={}", session.session_id()),
+                "-e".to_string(),
+                "GH_TOKEN=gh-token".to_string(),
+                "-e".to_string(),
+                "GITHUB_TOKEN=github-token".to_string(),
+                "-e".to_string(),
+                format!("HTTP_PROXY=http://{BROKER_INTERNAL_HOST}:{BROKER_LISTEN_PORT}"),
+                "-e".to_string(),
+                format!("HTTPS_PROXY=http://{BROKER_INTERNAL_HOST}:{BROKER_LISTEN_PORT}"),
+                "-e".to_string(),
+                format!("ALL_PROXY=http://{BROKER_INTERNAL_HOST}:{BROKER_LISTEN_PORT}"),
+                "-e".to_string(),
+                format!("http_proxy=http://{BROKER_INTERNAL_HOST}:{BROKER_LISTEN_PORT}"),
+                "-e".to_string(),
+                format!("https_proxy=http://{BROKER_INTERNAL_HOST}:{BROKER_LISTEN_PORT}"),
+                "-e".to_string(),
+                format!("all_proxy=http://{BROKER_INTERNAL_HOST}:{BROKER_LISTEN_PORT}"),
+                "-e".to_string(),
+                format!("NO_PROXY=localhost,127.0.0.1,{BROKER_INTERNAL_HOST}"),
+                "-e".to_string(),
+                format!("no_proxy=localhost,127.0.0.1,{BROKER_INTERNAL_HOST}"),
+                "-v".to_string(),
+                format!("{}:/home/copilot", session.workspace_home().display()),
+                "-v".to_string(),
+                format!(
+                    "{}:/home/copilot/.copilot/skills:ro",
+                    shared_skills.display()
+                ),
+                "-v".to_string(),
+                format!("{}:/workspace", session.workspace().display()),
+                "test-image:latest".to_string(),
+                "--resume".to_string(),
+                "session-123".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn broker_run_plan_captures_session_mounts_and_broker_files() {
+        let root = unique_test_dir("broker-run-plan");
+        let config = AppConfig::for_tests(&root);
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let session = SessionContext::new_session(&config, workspace, &[]).unwrap();
+        let network = SessionNetwork {
+            runtime: "docker".to_string(),
+            internal_name: "llm-box-internal-test".to_string(),
+            external_name: "llm-box-external-test".to_string(),
+        };
+
+        let plan = build_broker_run_plan(
+            "docker",
+            "test-image:latest",
+            &session,
+            &network,
+            "host.docker.internal",
+            true,
+        );
+
+        assert_eq!(
+            plan.args,
+            vec![
+                "run".to_string(),
+                "--rm".to_string(),
+                "--name".to_string(),
+                format!("llm-box-broker-{}", session.session_id()),
+                "--network".to_string(),
+                "llm-box-internal-test".to_string(),
+                "--network-alias".to_string(),
+                BROKER_INTERNAL_HOST.to_string(),
+                "-v".to_string(),
+                format!("{}:/llm-box/session", session.session_dir().display()),
+                "--entrypoint".to_string(),
+                "llm-box".to_string(),
+                "--add-host=host.docker.internal:host-gateway".to_string(),
+                "test-image:latest".to_string(),
+                "__broker".to_string(),
+                "--listen-host".to_string(),
+                "0.0.0.0".to_string(),
+                "--listen-port".to_string(),
+                BROKER_LISTEN_PORT.to_string(),
+                "--allowed-targets-file".to_string(),
+                "/llm-box/session/allowed-targets.txt".to_string(),
+                "--pending-events-file".to_string(),
+                "/llm-box/session/pending-events.jsonl".to_string(),
+                "--connectors-file".to_string(),
+                "/llm-box/session/connectors.json".to_string(),
+                "--broker-ready-file".to_string(),
+                "/llm-box/session/broker-ready.json".to_string(),
+                "--host-loopback-alias".to_string(),
+                "host.docker.internal".to_string(),
+            ]
+        );
 
         let _ = fs::remove_dir_all(root);
     }
