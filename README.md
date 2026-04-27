@@ -60,9 +60,13 @@ llm-box copilot --resume <session-id>
 
 Anything after `copilot` is passed through to the real `copilot` command inside the container.
 
-For the same workspace, `llm-box` reuses a persisted `HOME` under `~/.llm-box/workspaces/<workspace-hash>/home`.
-That means file-backed tool state survives fresh containers in that workspace, including Copilot login, `~/.ssh/known_hosts`, and other config written under `HOME`.
-If you need private SSH keys for a workflow, place them intentionally in that persisted home. `llm-box` does not import host SSH keys automatically.
+For the same workspace, `llm-box` reuses a persisted `HOME` under `~/.llm-box/workspaces/<workspace-hash>/home`, so files written there survive fresh containers for that workspace.
+
+## Security boundary
+
+- `llm-box` runs the assistant in a disposable container.
+- Outbound access is blocked by default and allowed explicitly through `llm-box`.
+- Workspace `HOME` persists across fresh containers for the same workspace.
 
 ## Basic commands
 
