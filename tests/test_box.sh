@@ -197,8 +197,9 @@ if [[ -e "$SHARED_SKILLS_DIR/git-commit/SHOULD-NOT-WRITE" ]]; then
   fail "shared skills mount was unexpectedly writable"
 fi
 
-echo "[5/12] verifying provider home is isolated per workspace"
+echo "[5/12] verifying provider home is persisted and isolated per workspace"
 (cd "$WORKSPACE_E" && LLM_BOX_IMAGE="$TEST_IMAGE" "$BINARY" copilot 'git config --global user.name workspace-e && git config --global user.email e@example.com')
+(cd "$WORKSPACE_E" && LLM_BOX_IMAGE="$TEST_IMAGE" "$BINARY" copilot 'grep -q workspace-e "$HOME/.gitconfig"')
 (cd "$WORKSPACE_F" && LLM_BOX_IMAGE="$TEST_IMAGE" "$BINARY" copilot 'if [ -f "$HOME/.gitconfig" ]; then ! grep -q workspace-e "$HOME/.gitconfig"; fi && git config --global user.name workspace-f && git config --global user.email f@example.com')
 WORKSPACE_HOME_E="$(workspace_home_dir "$WORKSPACE_E" "$TEST_HOME")"
 WORKSPACE_HOME_F="$(workspace_home_dir "$WORKSPACE_F" "$TEST_HOME")"
