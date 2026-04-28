@@ -48,6 +48,7 @@ llm-box copilot
 What happens:
 
 1. Copilot starts in your terminal
+1. if that workspace is not signed in yet, `llm-box` runs a short login bootstrap first
 2. `llm-box` opens or reuses the browser UI
 3. new outbound destinations show up as pending
 4. you decide what to allow
@@ -61,6 +62,8 @@ llm-box copilot --resume <session-id>
 Anything after `copilot` is passed through to the real `copilot` command inside the container.
 
 For the same workspace, `llm-box` reuses a persisted `HOME` under `~/.llm-box/workspaces/<workspace-hash>/home`, so files written there survive fresh containers for that workspace.
+
+The login bootstrap uses that same persisted home, so signing in once is reused for later `llm-box copilot` launches without leaving `github.com:443` approved in the real session.
 
 ## Security boundary
 
@@ -161,9 +164,12 @@ If you want to work on `llm-box` itself:
 ```bash
 git clone https://github.com/olillevik/llm-box.git
 cd llm-box
+./scripts/setup-git-hooks
 cargo test
 bash ./tests/test_box.sh
 ```
+
+The repo git hook reinstalls `llm-box` from the current checkout after commits on `main`, so contributors dogfood the latest local version.
 
 Useful local commands:
 

@@ -58,6 +58,23 @@ impl SessionContext {
         workspace: PathBuf,
         args: &[String],
     ) -> Result<Self> {
+        Self::new_session_with_visibility(config, workspace, args, true)
+    }
+
+    pub(crate) fn new_transient_session(
+        config: &AppConfig,
+        workspace: PathBuf,
+        args: &[String],
+    ) -> Result<Self> {
+        Self::new_session_with_visibility(config, workspace, args, false)
+    }
+
+    fn new_session_with_visibility(
+        config: &AppConfig,
+        workspace: PathBuf,
+        args: &[String],
+        publish_latest: bool,
+    ) -> Result<Self> {
         let workspace = fs::canonicalize(&workspace)
             .with_context(|| format!("failed to canonicalize {}", workspace.display()))?;
         let workspace_dir = config.workspaces_root().join(workspace_key(&workspace));
@@ -67,10 +84,12 @@ impl SessionContext {
         let session = Self::from_parts(config, workspace, workspace_dir, session_id);
         session.ensure(config)?;
         session.save_session_meta(args)?;
-        write_atomic(
-            &session.workspace_dir.join("latest-session"),
-            session.session_id.as_bytes(),
-        )?;
+        if publish_latest {
+            write_atomic(
+                &session.workspace_dir.join("latest-session"),
+                session.session_id.as_bytes(),
+            )?;
+        }
         Ok(session)
     }
 
@@ -630,8 +649,14 @@ impl Drop for FileLock {
 fn generate_session_id(workspace: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(workspace.as_os_str().as_encoded_bytes());
-    hasher.update(current_epoch_seconds().to_string().as_bytes());
+    hasher.update(current_epoch_nanos().to_string().as_bytes());
     hasher.update(std::process::id().to_string().as_bytes());
+    hasher.update(
+        TEMP_FILE_COUNTER
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string()
+            .as_bytes(),
+    );
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
@@ -812,6 +837,25 @@ mod tests {
                 .unwrap()
                 .contains(&"https://later.example:443".to_string())
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transient_sessions_do_not_replace_latest_session() {
+        let root = unique_test_dir("transient-session");
+        let config = AppConfig::for_tests(&root);
+        let workspace = root.join("workspace-transient");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let latest = SessionContext::new_session(&config, workspace.clone(), &[]).unwrap();
+        let transient =
+            SessionContext::new_transient_session(&config, workspace.clone(), &["login".into()])
+                .unwrap();
+        let resolved = SessionContext::latest_for_workspace(&config, workspace).unwrap();
+
+        assert_eq!(resolved.session_id(), latest.session_id());
+        assert_ne!(resolved.session_id(), transient.session_id());
 
         let _ = fs::remove_dir_all(root);
     }
