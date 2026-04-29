@@ -62,7 +62,9 @@ Anything after `copilot` is passed through to the real `copilot` command inside 
 
 For the same workspace, `llm-box` reuses a persisted `HOME` under `~/.llm-box/workspaces/<workspace-hash>/home`, so files written there survive fresh containers for that workspace.
 
-If you already ran `gh auth login` on the host, `llm-box` reuses that GitHub token for the boxed Copilot run.
+For direct Copilot launches, `llm-box` points Copilot at a managed config directory under that persisted home, so stale provider state from older experiments does not affect new boxed sessions.
+
+If you already ran `gh auth login` on the host, `llm-box` reuses that GitHub token for the boxed Copilot run only.
 
 ## Security boundary
 

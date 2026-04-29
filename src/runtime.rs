@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,12 @@ const REPO_OVERLAY_DOCKERFILE: &str = ".llm-box/Dockerfile";
 const REPO_OVERLAY_BASE_IMAGE_ARG: &str = "LLM_BOX_BASE_IMAGE";
 const PROVIDER_AUTH_ENV_KEYS: &[&str] = &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
 const GH_AUTH_REUSE_TIP: &str = "llm-box: no reusable GitHub token found. Tip: run `gh auth login` on the host to let llm-box reuse your GitHub auth.";
+const MANAGED_COPILOT_CONFIG_DIR: &str = "/home/copilot/.llm-box/providers/copilot";
+const LEGACY_AUTH_MARKER_FILE: &str = "llm-box-authenticated.json";
+const WORKSPACE_STATE_VERSION: u32 = 1;
+const WORKSPACE_STATE_VERSION_FILE: &str = "workspace-state.json";
+const OPTIONAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const HOST_GH_AUTH_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const INIT_IMAGE_TEMPLATE: &str = r#"ARG LLM_BOX_BASE_IMAGE
 FROM ${LLM_BOX_BASE_IMAGE}
 
@@ -35,6 +42,13 @@ enum GhAuthStatus {
     Unavailable,
     Authenticated(String),
     NotAuthenticated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigDirArg {
+    Absent,
+    Present(String),
+    MissingValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +86,21 @@ pub(crate) fn run_copilot(config: &AppConfig, args: &[String]) -> Result<i32> {
     let runtime = detect_runtime()?;
     ensure_runtime_ready(&runtime)?;
     let image_name = ensure_copilot_image(config, &runtime, &workspace)?;
+    let workspace_home = workspace_home_for(config, &workspace);
+    migrate_workspace_home_state(&workspace_home)?;
+    let explicit_auth_env = collect_passthrough_env(PROVIDER_AUTH_ENV_KEYS);
+    let gh_auth_status = if explicit_auth_env.is_empty() {
+        query_host_gh_auth_status()
+    } else {
+        GhAuthStatus::Unavailable
+    };
+    let provider_auth = resolve_provider_auth_env(explicit_auth_env, gh_auth_status);
+    let image_uses_copilot = image_entrypoint_uses_copilot(&runtime, &image_name)?;
+    let invocation_args = if image_uses_copilot {
+        inject_managed_config_dir(args)
+    } else {
+        args.to_vec()
+    };
     let session = SessionContext::new_session(config, workspace, args)?;
     let _active_session = session.mark_active()?;
     let network = SessionNetwork::create(&runtime, session.session_id())?;
@@ -86,16 +115,7 @@ pub(crate) fn run_copilot(config: &AppConfig, args: &[String]) -> Result<i32> {
 
     let uid = current_command_output("id", ["-u"])?;
     let gid = current_command_output("id", ["-g"])?;
-    let explicit_auth_env = collect_passthrough_env(PROVIDER_AUTH_ENV_KEYS);
-    let gh_auth_status = if explicit_auth_env.is_empty() {
-        query_host_gh_auth_status()?
-    } else {
-        GhAuthStatus::Unavailable
-    };
-    let provider_auth = resolve_provider_auth_env(explicit_auth_env, gh_auth_status);
-    let secret_env_vars = if provider_auth.secret_env_vars.is_empty()
-        || !image_entrypoint_uses_copilot(&runtime, &image_name)?
-    {
+    let secret_env_vars = if provider_auth.secret_env_vars.is_empty() || !image_uses_copilot {
         Vec::new()
     } else {
         provider_auth.secret_env_vars.clone()
@@ -112,7 +132,7 @@ pub(crate) fn run_copilot(config: &AppConfig, args: &[String]) -> Result<i32> {
         &uid,
         &gid,
         tty_mode,
-        args,
+        &invocation_args,
         &provider_auth.passthrough_env,
         &secret_env_vars,
         config.shared_copilot_skills_dir(),
@@ -245,14 +265,25 @@ fn resolve_provider_auth_env(
     }
 }
 
-fn query_host_gh_auth_status() -> Result<GhAuthStatus> {
+fn query_host_gh_auth_status() -> GhAuthStatus {
     if !command_exists("gh") {
-        return Ok(GhAuthStatus::Unavailable);
+        return GhAuthStatus::Unavailable;
     }
-    Ok(match try_command_output("gh", ["auth", "token"])? {
-        Some(token) => GhAuthStatus::Authenticated(token),
-        None => GhAuthStatus::NotAuthenticated,
-    })
+    match try_optional_command_output(
+        "gh",
+        ["auth", "token"],
+        &[
+            ("GH_PROMPT_DISABLED", "1"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GH_NO_UPDATE_NOTIFIER", "1"),
+            ("GH_NO_EXTENSION_UPDATE_NOTIFIER", "1"),
+        ],
+        HOST_GH_AUTH_LOOKUP_TIMEOUT,
+    ) {
+        Ok(Some(token)) => GhAuthStatus::Authenticated(token),
+        Ok(None) => GhAuthStatus::NotAuthenticated,
+        Err(_) => GhAuthStatus::Unavailable,
+    }
 }
 
 fn should_emit_gh_auth_tip(args: &[String]) -> bool {
@@ -266,6 +297,36 @@ fn should_emit_gh_auth_tip(args: &[String]) -> bool {
         args.first().map(String::as_str),
         Some("help" | "init" | "login" | "mcp" | "plugin" | "update" | "version")
     )
+}
+
+fn config_dir_arg(args: &[String]) -> ConfigDirArg {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(value) = arg.strip_prefix("--config-dir=") {
+            return ConfigDirArg::Present(value.to_string());
+        }
+        if arg == "--config-dir" {
+            return match iter.next() {
+                Some(value) => ConfigDirArg::Present(value.clone()),
+                None => ConfigDirArg::MissingValue,
+            };
+        }
+    }
+    ConfigDirArg::Absent
+}
+
+fn inject_managed_config_dir(args: &[String]) -> Vec<String> {
+    match config_dir_arg(args) {
+        ConfigDirArg::Absent => {
+            let mut normalized = vec![
+                "--config-dir".to_string(),
+                MANAGED_COPILOT_CONFIG_DIR.to_string(),
+            ];
+            normalized.extend(args.iter().cloned());
+            normalized
+        }
+        ConfigDirArg::Present(_) | ConfigDirArg::MissingValue => args.to_vec(),
+    }
 }
 
 fn build_copilot_run_plan(
@@ -597,24 +658,135 @@ where
         .to_string())
 }
 
-fn try_command_output<I, S>(program: &str, args: I) -> Result<Option<String>>
+fn try_optional_command_output<I, S>(
+    program: &str,
+    args: I,
+    env_overrides: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<Option<String>>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new(program)
+    let stdout_path = unique_runtime_temp_path(program, "stdout");
+    let stderr_path = unique_runtime_temp_path(program, "stderr");
+    let stdout = File::create(&stdout_path)
+        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+    let stderr = File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let mut command = Command::new(program);
+    command
         .args(args)
-        .output()
+        .envs(env_overrides.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    let mut child = command
+        .spawn()
         .with_context(|| format!("failed to run `{program}`"))?;
-    if !output.status.success() {
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_file(&stdout_path);
+                let _ = fs::remove_file(&stderr_path);
+                return Ok(None);
+            }
+            Ok(None) => thread::sleep(OPTIONAL_COMMAND_POLL_INTERVAL),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_file(&stdout_path);
+                let _ = fs::remove_file(&stderr_path);
+                return Err(error).with_context(|| format!("failed to poll `{program}`"));
+            }
+        }
+    };
+    let stdout = fs::read(stdout_path.as_path())
+        .with_context(|| format!("failed to read {}", stdout_path.display()))?;
+    let _ = fs::remove_file(&stdout_path);
+    let _ = fs::remove_file(&stderr_path);
+    if !status.success() {
         return Ok(None);
     }
-    let stdout = String::from_utf8(output.stdout).context("command output was not valid utf-8")?;
+    let stdout = String::from_utf8(stdout).context("command output was not valid utf-8")?;
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         Ok(None)
     } else {
         Ok(Some(trimmed.to_string()))
+    }
+}
+
+fn unique_runtime_temp_path(program: &str, suffix: &str) -> PathBuf {
+    let sanitized = program.replace(std::path::MAIN_SEPARATOR, "_");
+    env::temp_dir().join(format!(
+        "llm-box-{sanitized}-{suffix}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ))
+}
+
+fn workspace_home_for(config: &AppConfig, workspace: &Path) -> PathBuf {
+    config
+        .workspaces_root()
+        .join(workspace_key(workspace))
+        .join("home")
+}
+
+fn migrate_workspace_home_state(workspace_home: &Path) -> Result<()> {
+    let state_dir = workspace_home.join(".llm-box");
+    fs::create_dir_all(state_dir.join("providers/copilot")).with_context(|| {
+        format!(
+            "failed to create {}",
+            state_dir.join("providers/copilot").display()
+        )
+    })?;
+    let version_file = state_dir.join(WORKSPACE_STATE_VERSION_FILE);
+    let version = read_workspace_state_version(&version_file)?;
+    if version < 1 {
+        migrate_workspace_home_v1(workspace_home)?;
+    }
+    if version != WORKSPACE_STATE_VERSION {
+        write_atomic(
+            &version_file,
+            format!("{WORKSPACE_STATE_VERSION}\n").as_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+fn read_workspace_state_version(path: &Path) -> Result<u32> {
+    match fs::read_to_string(path) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u32>()
+            .with_context(|| format!("failed to parse {}", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+fn migrate_workspace_home_v1(workspace_home: &Path) -> Result<()> {
+    let copilot_dir = workspace_home.join(".copilot");
+    remove_file_if_exists(&copilot_dir.join(LEGACY_AUTH_MARKER_FILE))?;
+    remove_file_if_exists(
+        &copilot_dir.join(format!(".{}.bootstrap.lock", LEGACY_AUTH_MARKER_FILE)),
+    )?;
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
     }
 }
 
@@ -919,7 +1091,12 @@ mod tests {
             internal_name: "llm-box-internal-test".to_string(),
             external_name: "llm-box-external-test".to_string(),
         };
-        let invocation = vec!["--resume".to_string(), "session-123".to_string()];
+        let invocation = vec![
+            "--config-dir".to_string(),
+            MANAGED_COPILOT_CONFIG_DIR.to_string(),
+            "--resume".to_string(),
+            "session-123".to_string(),
+        ];
         let passthrough_env = vec![
             (
                 "COPILOT_GITHUB_TOKEN".to_string(),
@@ -998,6 +1175,8 @@ mod tests {
                 format!("{}:/workspace", session.workspace().display()),
                 "test-image:latest".to_string(),
                 "--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN".to_string(),
+                "--config-dir".to_string(),
+                MANAGED_COPILOT_CONFIG_DIR.to_string(),
                 "--resume".to_string(),
                 "session-123".to_string(),
             ]
@@ -1061,6 +1240,138 @@ mod tests {
                 user_tip: Some(GH_AUTH_REUSE_TIP),
             }
         );
+    }
+
+    #[test]
+    fn try_optional_command_output_times_out() {
+        let result =
+            try_optional_command_output("sh", ["-c", "sleep 1"], &[], Duration::from_millis(10))
+                .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn inject_managed_config_dir_only_when_missing() {
+        assert_eq!(
+            inject_managed_config_dir(&["--resume".to_string(), "abc".to_string()]),
+            vec![
+                "--config-dir".to_string(),
+                MANAGED_COPILOT_CONFIG_DIR.to_string(),
+                "--resume".to_string(),
+                "abc".to_string(),
+            ]
+        );
+        assert_eq!(
+            inject_managed_config_dir(&[
+                "--config-dir".to_string(),
+                "/workspace/custom".to_string(),
+                "--resume".to_string(),
+            ]),
+            vec![
+                "--config-dir".to_string(),
+                "/workspace/custom".to_string(),
+                "--resume".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn migrate_workspace_home_state_removes_only_legacy_llm_box_artifacts() {
+        let root = unique_test_dir("migrate-workspace-home");
+        let config = AppConfig::for_tests(&root);
+        let workspace = root.join("workspace");
+        let workspace_home = workspace_home_for(&config, &workspace);
+        let copilot_dir = workspace_home.join(".copilot");
+        fs::create_dir_all(&copilot_dir).unwrap();
+        fs::write(
+            copilot_dir.join("config.json"),
+            r#"{
+  "banner": "never",
+  "copilotTokens": { "https://github.com:user": "token" },
+  "lastLoggedInUser": { "host": "https://github.com", "login": "user" },
+  "loggedInUsers": [{ "host": "https://github.com", "login": "user" }]
+}
+"#,
+        )
+        .unwrap();
+        fs::write(copilot_dir.join(LEGACY_AUTH_MARKER_FILE), "1\n").unwrap();
+        fs::write(
+            copilot_dir.join(format!(".{}.bootstrap.lock", LEGACY_AUTH_MARKER_FILE)),
+            "lock\n",
+        )
+        .unwrap();
+
+        migrate_workspace_home_state(&workspace_home).unwrap();
+
+        let config_contents = fs::read_to_string(copilot_dir.join("config.json")).unwrap();
+        assert!(config_contents.contains("copilotTokens"));
+        assert!(config_contents.contains("lastLoggedInUser"));
+        assert!(config_contents.contains("loggedInUsers"));
+        assert!(!copilot_dir.join(LEGACY_AUTH_MARKER_FILE).exists());
+        assert!(
+            !copilot_dir
+                .join(format!(".{}.bootstrap.lock", LEGACY_AUTH_MARKER_FILE))
+                .exists()
+        );
+        assert_eq!(
+            fs::read_to_string(
+                workspace_home
+                    .join(".llm-box")
+                    .join(WORKSPACE_STATE_VERSION_FILE)
+            )
+            .unwrap(),
+            format!("{WORKSPACE_STATE_VERSION}\n")
+        );
+        assert!(workspace_home.join(".llm-box/providers/copilot").is_dir());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migrate_workspace_home_state_is_idempotent() {
+        let root = unique_test_dir("migrate-workspace-home-idempotent");
+        let config = AppConfig::for_tests(&root);
+        let workspace = root.join("workspace");
+        let workspace_home = workspace_home_for(&config, &workspace);
+        let copilot_dir = workspace_home.join(".copilot");
+        fs::create_dir_all(&copilot_dir).unwrap();
+        fs::write(
+            copilot_dir.join("config.json"),
+            r#"{
+  "banner": "never",
+  "copilotTokens": { "https://github.com:user": "token" }
+}
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(workspace_home.join(".llm-box")).unwrap();
+        fs::write(
+            workspace_home
+                .join(".llm-box")
+                .join(WORKSPACE_STATE_VERSION_FILE),
+            format!("{WORKSPACE_STATE_VERSION}\n"),
+        )
+        .unwrap();
+
+        migrate_workspace_home_state(&workspace_home).unwrap();
+
+        assert!(
+            fs::read_to_string(copilot_dir.join("config.json"))
+                .unwrap()
+                .contains("copilotTokens")
+        );
+        assert_eq!(
+            fs::read_to_string(
+                workspace_home
+                    .join(".llm-box")
+                    .join(WORKSPACE_STATE_VERSION_FILE)
+            )
+            .unwrap(),
+            format!("{WORKSPACE_STATE_VERSION}\n")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
