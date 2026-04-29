@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub(crate) const DEFAULT_ALLOWED_TARGETS: &[&str] = &[
     "https://api.github.com:443",
     "https://api.business.githubcopilot.com:443",
+    "https://telemetry.business.githubcopilot.com:443",
 ];
 const COPILOT_PROVIDER: &str = "copilot";
 
@@ -802,6 +803,7 @@ mod tests {
         assert!(allowed.contains(&"https://seeded.example:443".to_string()));
         assert!(allowed.contains(&"https://api.github.com:443".to_string()));
         assert!(allowed.contains(&"https://api.business.githubcopilot.com:443".to_string()));
+        assert!(allowed.contains(&"https://telemetry.business.githubcopilot.com:443".to_string()));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -813,6 +815,7 @@ mod tests {
             &[
                 "https://api.github.com:443",
                 "https://api.business.githubcopilot.com:443",
+                "https://telemetry.business.githubcopilot.com:443",
             ]
         );
     }
