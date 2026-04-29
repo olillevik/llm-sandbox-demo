@@ -48,7 +48,6 @@ llm-box copilot
 What happens:
 
 1. Copilot starts in your terminal
-1. if that workspace is not signed in yet, `llm-box` runs a short login bootstrap first
 2. `llm-box` opens or reuses the browser UI
 3. new outbound destinations show up as pending
 4. you decide what to allow
@@ -63,7 +62,7 @@ Anything after `copilot` is passed through to the real `copilot` command inside 
 
 For the same workspace, `llm-box` reuses a persisted `HOME` under `~/.llm-box/workspaces/<workspace-hash>/home`, so files written there survive fresh containers for that workspace.
 
-The login bootstrap uses that same persisted home, so signing in once is reused for later `llm-box copilot` launches without leaving `github.com:443` approved in the real session.
+If you already ran `gh auth login` on the host, `llm-box` reuses that GitHub token for the boxed Copilot run.
 
 ## Security boundary
 

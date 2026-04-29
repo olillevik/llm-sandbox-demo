@@ -58,23 +58,6 @@ impl SessionContext {
         workspace: PathBuf,
         args: &[String],
     ) -> Result<Self> {
-        Self::new_session_with_visibility(config, workspace, args, true)
-    }
-
-    pub(crate) fn new_transient_session(
-        config: &AppConfig,
-        workspace: PathBuf,
-        args: &[String],
-    ) -> Result<Self> {
-        Self::new_session_with_visibility(config, workspace, args, false)
-    }
-
-    fn new_session_with_visibility(
-        config: &AppConfig,
-        workspace: PathBuf,
-        args: &[String],
-        publish_latest: bool,
-    ) -> Result<Self> {
         let workspace = fs::canonicalize(&workspace)
             .with_context(|| format!("failed to canonicalize {}", workspace.display()))?;
         let workspace_dir = config.workspaces_root().join(workspace_key(&workspace));
@@ -84,12 +67,10 @@ impl SessionContext {
         let session = Self::from_parts(config, workspace, workspace_dir, session_id);
         session.ensure(config)?;
         session.save_session_meta(args)?;
-        if publish_latest {
-            write_atomic(
-                &session.workspace_dir.join("latest-session"),
-                session.session_id.as_bytes(),
-            )?;
-        }
+        write_atomic(
+            &session.workspace_dir.join("latest-session"),
+            session.session_id.as_bytes(),
+        )?;
         Ok(session)
     }
 
@@ -432,6 +413,7 @@ impl SessionStore {
 
     pub(crate) fn deny_target(&self, target: &str) -> Result<()> {
         let target = parse_target_spec(target)?;
+        let target_key = target.to_string();
         let denied_target = target.clone();
         self.update_allowed_targets(move |targets| {
             targets.remove(&denied_target);
@@ -440,7 +422,7 @@ impl SessionStore {
         if target.uses_connector() {
             self.remove_connector_for_target(&target)?;
         }
-        Ok(())
+        self.acknowledge_target(&target_key)
     }
 
     pub(crate) fn dismiss_target(&self, target: &str) -> Result<()> {
@@ -842,25 +824,6 @@ mod tests {
     }
 
     #[test]
-    fn transient_sessions_do_not_replace_latest_session() {
-        let root = unique_test_dir("transient-session");
-        let config = AppConfig::for_tests(&root);
-        let workspace = root.join("workspace-transient");
-        fs::create_dir_all(&workspace).unwrap();
-
-        let latest = SessionContext::new_session(&config, workspace.clone(), &[]).unwrap();
-        let transient =
-            SessionContext::new_transient_session(&config, workspace.clone(), &["login".into()])
-                .unwrap();
-        let resolved = SessionContext::latest_for_workspace(&config, workspace).unwrap();
-
-        assert_eq!(resolved.session_id(), latest.session_id());
-        assert_ne!(resolved.session_id(), transient.session_id());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn session_store_reports_pending_line_numbers() {
         let root = unique_test_dir("invalid-pending-log");
         let store = session_store_fixture(&root);
@@ -1115,6 +1078,53 @@ mod tests {
         assert_eq!(
             fs::read_to_string(session.store().connectors_file()).unwrap(),
             "[]\n"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deny_target_hides_prior_pending_event_until_new_attempt() {
+        let root = unique_test_dir("deny-hides-prior-pending");
+        let config = AppConfig::for_tests(&root);
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let session = SessionContext::new_session(&config, workspace, &[]).unwrap();
+        let target = "tcp://db.example.internal:5432";
+        let store = session.store();
+        let prior_event = PendingLogEntry {
+            event_epoch_nanos: "1".to_string(),
+            kind: crate::egress::EgressKind::Tcp,
+            host: "db.example.internal".to_string(),
+            port: 5432,
+        };
+        fs::write(
+            store.pending_events_file(),
+            format!("{}\n", serde_json::to_string(&prior_event).unwrap()),
+        )
+        .unwrap();
+
+        session.allow_target(target).unwrap();
+        assert!(session.pending_items().unwrap().is_empty());
+
+        session.deny_target(target).unwrap();
+        assert!(session.pending_items().unwrap().is_empty());
+
+        let new_event = PendingLogEntry {
+            event_epoch_nanos: current_epoch_nanos().to_string(),
+            kind: crate::egress::EgressKind::Tcp,
+            host: "db.example.internal".to_string(),
+            port: 5432,
+        };
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(store.pending_events_file())
+            .unwrap();
+        writeln!(file, "{}", serde_json::to_string(&new_event).unwrap()).unwrap();
+
+        assert_eq!(
+            pending_targets(&session),
+            vec!["tcp://db.example.internal:5432".to_string()]
         );
 
         let _ = fs::remove_dir_all(root);

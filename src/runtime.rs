@@ -1,28 +1,23 @@
 use crate::broker;
 use crate::config::AppConfig;
 use crate::egress::{BROKER_INTERNAL_HOST, parse_target_spec};
-use crate::session::{
-    SessionContext, current_epoch_seconds, process_is_running, workspace_key, write_atomic,
-};
+use crate::session::{SessionContext, workspace_key, write_atomic};
 use crate::ui::ApprovalsHub;
 use anyhow::{Context, Result, bail};
 use std::env;
 use std::ffi::OsStr;
-use std::fs::{self, OpenOptions};
-use std::io::ErrorKind;
+use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpStream;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 const REPO_OVERLAY_DOCKERFILE: &str = ".llm-box/Dockerfile";
 const REPO_OVERLAY_BASE_IMAGE_ARG: &str = "LLM_BOX_BASE_IMAGE";
-const DEFAULT_COPILOT_CONFIG_DIR: &str = "/home/copilot/.copilot";
-const AUTH_MARKER_FILE: &str = "llm-box-authenticated.json";
-const DEFAULT_LOGIN_TARGET: &str = "https://github.com:443";
-const AUTH_BOOTSTRAP_LOCK_STALE_AFTER: Duration = Duration::from_secs(60 * 60);
+const PROVIDER_AUTH_ENV_KEYS: &[&str] = &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
+const GH_AUTH_REUSE_TIP: &str = "llm-box: no reusable GitHub token found. Tip: run `gh auth login` on the host to let llm-box reuse your GitHub auth.";
 const INIT_IMAGE_TEMPLATE: &str = r#"ARG LLM_BOX_BASE_IMAGE
 FROM ${LLM_BOX_BASE_IMAGE}
 
@@ -35,46 +30,18 @@ USER copilot
 
 pub(crate) const BROKER_LISTEN_PORT: u16 = 3128;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CopilotInvocationMode {
-    AutoSession,
-    ExplicitLogin,
-    SkipBootstrap,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GhAuthStatus {
+    Unavailable,
+    Authenticated(String),
+    NotAuthenticated,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ConfigDirArg {
-    Absent,
-    Present(String),
-    MissingValue,
-}
-
-#[derive(Debug)]
-struct AuthBootstrapLock {
-    path: PathBuf,
-    _file: fs::File,
-}
-
-impl Drop for AuthBootstrapLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-struct TransientSessionCleanup {
-    session_dir: PathBuf,
-}
-
-impl TransientSessionCleanup {
-    fn new(session_dir: PathBuf) -> Self {
-        Self { session_dir }
-    }
-}
-
-impl Drop for TransientSessionCleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.session_dir);
-    }
+struct ProviderAuthEnv {
+    passthrough_env: Vec<(String, String)>,
+    secret_env_vars: Vec<String>,
+    user_tip: Option<&'static str>,
 }
 
 pub(crate) fn build_image(config: &AppConfig) -> Result<()> {
@@ -102,116 +69,14 @@ pub(crate) fn init_repo_overlay_dockerfile(workspace: &Path) -> Result<PathBuf> 
 
 pub(crate) fn run_copilot(config: &AppConfig, args: &[String]) -> Result<i32> {
     let workspace = env::current_dir().context("failed to resolve current directory")?;
-    let workspace = fs::canonicalize(&workspace)
-        .with_context(|| format!("failed to canonicalize {}", workspace.display()))?;
     let runtime = detect_runtime()?;
     ensure_runtime_ready(&runtime)?;
     let image_name = ensure_copilot_image(config, &runtime, &workspace)?;
-    let invocation_mode = classify_copilot_invocation(args);
-    let can_manage_auth = image_entrypoint_is_copilot(&runtime, &image_name)?;
-    let session_args = if can_manage_auth {
-        inject_default_config_dir(args)
-    } else {
-        args.to_vec()
-    };
-    let auth_marker = managed_auth_marker_path(config, &workspace, args);
-
-    if can_manage_auth {
-        match invocation_mode {
-            CopilotInvocationMode::ExplicitLogin => {
-                let _bootstrap_lock = match auth_marker.as_deref() {
-                    Some(marker) => Some(acquire_auth_bootstrap_lock(Some(marker))?),
-                    None => None,
-                };
-                let exit_code = run_copilot_bootstrap(
-                    config,
-                    &runtime,
-                    &image_name,
-                    &workspace,
-                    &session_args,
-                )?;
-                if exit_code == 0 {
-                    persist_auth_marker(auth_marker.as_deref())?;
-                }
-                return Ok(exit_code);
-            }
-            CopilotInvocationMode::AutoSession => {
-                if should_bootstrap_auth(auth_marker.as_deref()) {
-                    let _bootstrap_lock = acquire_auth_bootstrap_lock(auth_marker.as_deref())?;
-                    if auth_marker.as_deref().is_some_and(Path::is_file) {
-                        // Another launch finished bootstrap while we were claiming the lock.
-                        return run_copilot_in_new_session(
-                            config,
-                            &runtime,
-                            &image_name,
-                            &workspace,
-                            &session_args,
-                        );
-                    }
-                    let bootstrap_args = bootstrap_login_args(&session_args);
-                    let exit_code = run_copilot_bootstrap(
-                        config,
-                        &runtime,
-                        &image_name,
-                        &workspace,
-                        &bootstrap_args,
-                    )?;
-                    if exit_code != 0 {
-                        return Ok(exit_code);
-                    }
-                    persist_auth_marker(auth_marker.as_deref())?;
-                }
-            }
-            CopilotInvocationMode::SkipBootstrap => {}
-        }
-    }
-
-    run_copilot_in_new_session(config, &runtime, &image_name, &workspace, &session_args)
-}
-
-fn run_copilot_bootstrap(
-    config: &AppConfig,
-    runtime: &str,
-    image_name: &str,
-    workspace: &Path,
-    args: &[String],
-) -> Result<i32> {
-    let session = SessionContext::new_transient_session(config, workspace.to_path_buf(), args)?;
-    let _cleanup = TransientSessionCleanup::new(session.session_dir().to_path_buf());
-    session.allow_target(&bootstrap_login_target(args)?)?;
-    run_copilot_in_session(config, runtime, image_name, &session, args, false, false)
-}
-
-fn run_copilot_in_new_session(
-    config: &AppConfig,
-    runtime: &str,
-    image_name: &str,
-    workspace: &Path,
-    args: &[String],
-) -> Result<i32> {
-    let session = SessionContext::new_session(config, workspace.to_path_buf(), args)?;
-    run_copilot_in_session(config, runtime, image_name, &session, args, true, true)
-}
-
-fn run_copilot_in_session(
-    config: &AppConfig,
-    runtime: &str,
-    image_name: &str,
-    session: &SessionContext,
-    args: &[String],
-    open_ui: bool,
-    mark_active: bool,
-) -> Result<i32> {
-    let _active_session = if mark_active {
-        Some(session.mark_active()?)
-    } else {
-        None
-    };
+    let session = SessionContext::new_session(config, workspace, args)?;
+    let _active_session = session.mark_active()?;
     let network = SessionNetwork::create(&runtime, session.session_id())?;
     let broker = BrokerProcess::start(&runtime, &image_name, &session, &network)?;
-    if open_ui {
-        ApprovalsHub::maybe_open(config, Some(session.session_id()))?;
-    }
+    ApprovalsHub::maybe_open(config, Some(session.session_id()))?;
 
     let tty_mode = if io::stdin().is_terminal() && io::stdout().is_terminal() {
         TtyMode::Interactive
@@ -221,8 +86,25 @@ fn run_copilot_in_session(
 
     let uid = current_command_output("id", ["-u"])?;
     let gid = current_command_output("id", ["-g"])?;
-    let passthrough_env =
-        collect_passthrough_env(&["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]);
+    let explicit_auth_env = collect_passthrough_env(PROVIDER_AUTH_ENV_KEYS);
+    let gh_auth_status = if explicit_auth_env.is_empty() {
+        query_host_gh_auth_status()?
+    } else {
+        GhAuthStatus::Unavailable
+    };
+    let provider_auth = resolve_provider_auth_env(explicit_auth_env, gh_auth_status);
+    let secret_env_vars = if provider_auth.secret_env_vars.is_empty()
+        || !image_entrypoint_uses_copilot(&runtime, &image_name)?
+    {
+        Vec::new()
+    } else {
+        provider_auth.secret_env_vars.clone()
+    };
+    if should_emit_gh_auth_tip(args) {
+        if let Some(tip) = provider_auth.user_tip {
+            eprintln!("{tip}");
+        }
+    }
     let plan = build_copilot_run_plan(
         &image_name,
         &session,
@@ -231,7 +113,8 @@ fn run_copilot_in_session(
         &gid,
         tty_mode,
         args,
-        &passthrough_env,
+        &provider_auth.passthrough_env,
+        &secret_env_vars,
         config.shared_copilot_skills_dir(),
     );
     let mut command = plan.command(&runtime);
@@ -244,256 +127,6 @@ fn run_copilot_in_session(
     Ok(status
         .code()
         .unwrap_or(if status.success() { 0 } else { 1 }))
-}
-
-fn classify_copilot_invocation(args: &[String]) -> CopilotInvocationMode {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
-    {
-        return CopilotInvocationMode::SkipBootstrap;
-    }
-    match args.first().map(String::as_str) {
-        Some("login") => CopilotInvocationMode::ExplicitLogin,
-        Some("help" | "init" | "mcp" | "plugin" | "update" | "version" | "-v" | "--version") => {
-            CopilotInvocationMode::SkipBootstrap
-        }
-        _ => CopilotInvocationMode::AutoSession,
-    }
-}
-
-fn should_bootstrap_auth(auth_marker: Option<&Path>) -> bool {
-    auth_marker.is_some() && !has_provider_auth_token() && !auth_marker.unwrap().is_file()
-}
-
-fn has_provider_auth_token() -> bool {
-    ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
-        .iter()
-        .any(|key| env::var_os(key).is_some())
-}
-
-fn bootstrap_login_args(invocation_args: &[String]) -> Vec<String> {
-    let mut args = vec!["login".to_string()];
-    if let Some(config_dir) = effective_container_config_dir(invocation_args) {
-        args.push("--config-dir".to_string());
-        args.push(config_dir);
-    }
-    args
-}
-
-fn bootstrap_login_target(args: &[String]) -> Result<String> {
-    let target = login_host_arg(args).unwrap_or_else(|| DEFAULT_LOGIN_TARGET.to_string());
-    Ok(parse_target_spec(&target)?.to_string())
-}
-
-fn login_host_arg(args: &[String]) -> Option<String> {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if let Some(value) = arg.strip_prefix("--host=") {
-            return Some(value.to_string());
-        }
-        if arg == "--host" {
-            return iter.next().cloned();
-        }
-    }
-    None
-}
-
-fn config_dir_arg(args: &[String]) -> ConfigDirArg {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if let Some(value) = arg.strip_prefix("--config-dir=") {
-            return ConfigDirArg::Present(value.to_string());
-        }
-        if arg == "--config-dir" {
-            return match iter.next() {
-                Some(value) => ConfigDirArg::Present(value.clone()),
-                None => ConfigDirArg::MissingValue,
-            };
-        }
-    }
-    ConfigDirArg::Absent
-}
-
-fn effective_container_config_dir(args: &[String]) -> Option<String> {
-    match config_dir_arg(args) {
-        ConfigDirArg::Absent => Some(DEFAULT_COPILOT_CONFIG_DIR.to_string()),
-        ConfigDirArg::Present(path) => Some(path),
-        ConfigDirArg::MissingValue => None,
-    }
-}
-
-fn inject_default_config_dir(args: &[String]) -> Vec<String> {
-    match config_dir_arg(args) {
-        ConfigDirArg::Absent => {
-            let mut normalized = vec![
-                "--config-dir".to_string(),
-                DEFAULT_COPILOT_CONFIG_DIR.to_string(),
-            ];
-            normalized.extend(args.iter().cloned());
-            normalized
-        }
-        ConfigDirArg::Present(_) | ConfigDirArg::MissingValue => args.to_vec(),
-    }
-}
-
-fn managed_auth_marker_path(
-    config: &AppConfig,
-    workspace: &Path,
-    invocation_args: &[String],
-) -> Option<PathBuf> {
-    let config_dir = effective_container_config_dir(invocation_args)?;
-    managed_host_path_for_container_path(config, workspace, &config_dir)
-        .map(|path| path.join(AUTH_MARKER_FILE))
-}
-
-fn managed_host_path_for_container_path(
-    config: &AppConfig,
-    workspace: &Path,
-    container_path: &str,
-) -> Option<PathBuf> {
-    let workspace_home = workspace_home_for(config, workspace);
-    if Path::new(container_path).is_absolute() {
-        return if container_path == "/home/copilot" {
-            Some(workspace_home)
-        } else if let Some(stripped) = container_path.strip_prefix("/home/copilot/") {
-            safe_join_relative(&workspace_home, stripped)
-        } else if container_path == "/workspace" {
-            Some(workspace.to_path_buf())
-        } else {
-            container_path
-                .strip_prefix("/workspace/")
-                .and_then(|stripped| safe_join_relative(workspace, stripped))
-        };
-    }
-    safe_join_relative(workspace, container_path)
-}
-
-fn workspace_home_for(config: &AppConfig, workspace: &Path) -> PathBuf {
-    config
-        .workspaces_root()
-        .join(workspace_key(workspace))
-        .join("home")
-}
-
-fn persist_auth_marker(marker: Option<&Path>) -> Result<()> {
-    let Some(marker) = marker else {
-        return Ok(());
-    };
-    if let Some(parent) = marker.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    write_atomic(marker, format!("{}\n", current_epoch_seconds()).as_bytes())
-}
-
-fn safe_join_relative(root: &Path, relative: &str) -> Option<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in Path::new(relative).components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(part) => normalized.push(part),
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    Some(root.join(normalized))
-}
-
-fn acquire_auth_bootstrap_lock(auth_marker: Option<&Path>) -> Result<AuthBootstrapLock> {
-    let auth_marker = auth_marker.context(
-        "cannot manage Copilot auth bootstrap for an unmapped config directory; pass a config dir under /home/copilot or /workspace",
-    )?;
-    let lock_path = auth_bootstrap_lock_path(auth_marker);
-    if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    loop {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut file) => {
-                writeln!(file, "{}", std::process::id())
-                    .with_context(|| format!("failed to write {}", lock_path.display()))?;
-                writeln!(file, "{}", current_epoch_seconds())
-                    .with_context(|| format!("failed to write {}", lock_path.display()))?;
-                return Ok(AuthBootstrapLock {
-                    path: lock_path,
-                    _file: file,
-                });
-            }
-            Err(error)
-                if error.kind() == ErrorKind::AlreadyExists
-                    && try_remove_stale_auth_bootstrap_lock(&lock_path)? =>
-            {
-                continue;
-            }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                bail!("Copilot login bootstrap is already running for this workspace");
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to create {}", lock_path.display()));
-            }
-        }
-    }
-}
-
-fn auth_bootstrap_lock_path(auth_marker: &Path) -> PathBuf {
-    let parent = auth_marker.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = auth_marker
-        .file_name()
-        .unwrap_or_else(|| OsStr::new(AUTH_MARKER_FILE))
-        .to_string_lossy();
-    parent.join(format!(".{file_name}.bootstrap.lock"))
-}
-
-fn try_remove_stale_auth_bootstrap_lock(lock_path: &Path) -> Result<bool> {
-    let contents = match fs::read_to_string(lock_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", lock_path.display()));
-        }
-    };
-
-    let pid = contents
-        .lines()
-        .next()
-        .and_then(|value| value.trim().parse::<u32>().ok());
-    let created_epoch = contents
-        .lines()
-        .nth(1)
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    let is_stale = match pid {
-        Some(pid) => !process_is_running(pid),
-        None => created_epoch
-            .map(|epoch| {
-                current_epoch_seconds().saturating_sub(epoch)
-                    >= AUTH_BOOTSTRAP_LOCK_STALE_AFTER.as_secs()
-            })
-            .unwrap_or_else(|| {
-                fs::metadata(lock_path)
-                    .ok()
-                    .and_then(|metadata| metadata.modified().ok())
-                    .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                    .map(|age| age >= AUTH_BOOTSTRAP_LOCK_STALE_AFTER)
-                    .unwrap_or(false)
-            }),
-    };
-    if !is_stale {
-        return Ok(false);
-    }
-
-    match fs::remove_file(lock_path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to remove {}", lock_path.display()))
-        }
-    }
 }
 
 pub(crate) fn request_connector_endpoint_from_broker(target: &str) -> Result<(String, String)> {
@@ -577,6 +210,64 @@ fn collect_passthrough_env(keys: &[&str]) -> Vec<(String, String)> {
         .collect()
 }
 
+fn resolve_provider_auth_env(
+    explicit_env: Vec<(String, String)>,
+    gh_auth_status: GhAuthStatus,
+) -> ProviderAuthEnv {
+    if !explicit_env.is_empty() {
+        let secret_env_vars = explicit_env
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        return ProviderAuthEnv {
+            passthrough_env: explicit_env,
+            secret_env_vars,
+            user_tip: None,
+        };
+    }
+
+    match gh_auth_status {
+        GhAuthStatus::Authenticated(token) => ProviderAuthEnv {
+            passthrough_env: vec![("COPILOT_GITHUB_TOKEN".to_string(), token)],
+            secret_env_vars: vec!["COPILOT_GITHUB_TOKEN".to_string()],
+            user_tip: None,
+        },
+        GhAuthStatus::NotAuthenticated => ProviderAuthEnv {
+            passthrough_env: Vec::new(),
+            secret_env_vars: Vec::new(),
+            user_tip: Some(GH_AUTH_REUSE_TIP),
+        },
+        GhAuthStatus::Unavailable => ProviderAuthEnv {
+            passthrough_env: Vec::new(),
+            secret_env_vars: Vec::new(),
+            user_tip: None,
+        },
+    }
+}
+
+fn query_host_gh_auth_status() -> Result<GhAuthStatus> {
+    if !command_exists("gh") {
+        return Ok(GhAuthStatus::Unavailable);
+    }
+    Ok(match try_command_output("gh", ["auth", "token"])? {
+        Some(token) => GhAuthStatus::Authenticated(token),
+        None => GhAuthStatus::NotAuthenticated,
+    })
+}
+
+fn should_emit_gh_auth_tip(args: &[String]) -> bool {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "-v" | "--version"))
+    {
+        return false;
+    }
+    !matches!(
+        args.first().map(String::as_str),
+        Some("help" | "init" | "login" | "mcp" | "plugin" | "update" | "version")
+    )
+}
+
 fn build_copilot_run_plan(
     image_name: &str,
     session: &SessionContext,
@@ -586,6 +277,7 @@ fn build_copilot_run_plan(
     tty_mode: TtyMode,
     invocation_args: &[String],
     passthrough_env: &[(String, String)],
+    secret_env_vars: &[String],
     shared_skills_dir: Option<&Path>,
 ) -> ContainerRunPlan {
     let mut args = vec!["run".to_string()];
@@ -644,6 +336,9 @@ fn build_copilot_run_plan(
     args.push("-v".to_string());
     args.push(format!("{}:/workspace", session.workspace().display()));
     args.push(image_name.to_string());
+    if !secret_env_vars.is_empty() {
+        args.push(format!("--secret-env-vars={}", secret_env_vars.join(",")));
+    }
     args.extend(invocation_args.iter().cloned());
     ContainerRunPlan { args }
 }
@@ -811,7 +506,7 @@ fn image_supports_broker(runtime: &str, image_name: &str) -> Result<bool> {
     Ok(output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1")
 }
 
-fn image_entrypoint_is_copilot(runtime: &str, image_name: &str) -> Result<bool> {
+fn image_entrypoint_uses_copilot(runtime: &str, image_name: &str) -> Result<bool> {
     let output = Command::new(runtime)
         .args([
             "image",
@@ -825,13 +520,15 @@ fn image_entrypoint_is_copilot(runtime: &str, image_name: &str) -> Result<bool> 
         .output()
         .with_context(|| format!("failed to inspect entrypoint for image `{image_name}`"))?;
     if !output.status.success() {
-        bail!("failed to inspect entrypoint for image `{image_name}`");
+        return Ok(false);
     }
-    let raw =
-        String::from_utf8(output.stdout).context("image inspect output was not valid utf-8")?;
-    let entrypoint: Option<Vec<String>> =
-        serde_json::from_str(raw.trim()).context("failed to parse image entrypoint")?;
-    Ok(matches!(entrypoint.as_deref(), Some([value]) if value == "copilot"))
+    let entrypoint =
+        String::from_utf8(output.stdout).context("image entrypoint was not valid utf-8")?;
+    Ok(entrypoint_invokes_copilot(&entrypoint))
+}
+
+fn entrypoint_invokes_copilot(entrypoint: &str) -> bool {
+    entrypoint.to_ascii_lowercase().contains("copilot")
 }
 
 fn detect_runtime() -> Result<String> {
@@ -898,6 +595,27 @@ where
         .context("command output was not valid utf-8")?
         .trim()
         .to_string())
+}
+
+fn try_command_output<I, S>(program: &str, args: I) -> Result<Option<String>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run `{program}`"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8(output.stdout).context("command output was not valid utf-8")?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
 }
 
 fn command_exists(program: &str) -> bool {
@@ -1201,12 +919,7 @@ mod tests {
             internal_name: "llm-box-internal-test".to_string(),
             external_name: "llm-box-external-test".to_string(),
         };
-        let invocation = vec![
-            "--config-dir".to_string(),
-            DEFAULT_COPILOT_CONFIG_DIR.to_string(),
-            "--resume".to_string(),
-            "session-123".to_string(),
-        ];
+        let invocation = vec!["--resume".to_string(), "session-123".to_string()];
         let passthrough_env = vec![
             (
                 "COPILOT_GITHUB_TOKEN".to_string(),
@@ -1214,6 +927,11 @@ mod tests {
             ),
             ("GH_TOKEN".to_string(), "gh-token".to_string()),
             ("GITHUB_TOKEN".to_string(), "github-token".to_string()),
+        ];
+        let secret_env_vars = vec![
+            "COPILOT_GITHUB_TOKEN".to_string(),
+            "GH_TOKEN".to_string(),
+            "GITHUB_TOKEN".to_string(),
         ];
 
         let plan = build_copilot_run_plan(
@@ -1225,6 +943,7 @@ mod tests {
             TtyMode::Interactive,
             &invocation,
             &passthrough_env,
+            &secret_env_vars,
             Some(shared_skills.as_path()),
         );
 
@@ -1278,8 +997,7 @@ mod tests {
                 "-v".to_string(),
                 format!("{}:/workspace", session.workspace().display()),
                 "test-image:latest".to_string(),
-                "--config-dir".to_string(),
-                DEFAULT_COPILOT_CONFIG_DIR.to_string(),
+                "--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN".to_string(),
                 "--resume".to_string(),
                 "session-123".to_string(),
             ]
@@ -1289,169 +1007,81 @@ mod tests {
     }
 
     #[test]
-    fn classify_copilot_invocation_distinguishes_bootstrap_modes() {
-        assert_eq!(
-            classify_copilot_invocation(&[]),
-            CopilotInvocationMode::AutoSession
-        );
-        assert_eq!(
-            classify_copilot_invocation(&["login".to_string()]),
-            CopilotInvocationMode::ExplicitLogin
-        );
-        assert_eq!(
-            classify_copilot_invocation(&["login".to_string(), "--help".to_string()]),
-            CopilotInvocationMode::SkipBootstrap
-        );
-        assert_eq!(
-            classify_copilot_invocation(&["--version".to_string()]),
-            CopilotInvocationMode::SkipBootstrap
-        );
-        assert_eq!(
-            classify_copilot_invocation(&["mcp".to_string()]),
-            CopilotInvocationMode::SkipBootstrap
-        );
-    }
-
-    #[test]
-    fn inject_default_config_dir_only_when_missing() {
-        assert_eq!(
-            inject_default_config_dir(&["--resume".to_string(), "abc".to_string()]),
+    fn provider_auth_env_prefers_explicit_tokens() {
+        let resolved = resolve_provider_auth_env(
             vec![
-                "--config-dir".to_string(),
-                DEFAULT_COPILOT_CONFIG_DIR.to_string(),
-                "--resume".to_string(),
-                "abc".to_string(),
-            ]
+                ("GH_TOKEN".to_string(), "gh-token".to_string()),
+                ("GITHUB_TOKEN".to_string(), "github-token".to_string()),
+            ],
+            GhAuthStatus::Authenticated("host-token".to_string()),
         );
+
         assert_eq!(
-            inject_default_config_dir(&[
-                "--config-dir".to_string(),
-                "/workspace/custom".to_string(),
-                "--resume".to_string(),
-            ]),
-            vec![
-                "--config-dir".to_string(),
-                "/workspace/custom".to_string(),
-                "--resume".to_string(),
-            ]
+            resolved,
+            ProviderAuthEnv {
+                passthrough_env: vec![
+                    ("GH_TOKEN".to_string(), "gh-token".to_string()),
+                    ("GITHUB_TOKEN".to_string(), "github-token".to_string()),
+                ],
+                secret_env_vars: vec!["GH_TOKEN".to_string(), "GITHUB_TOKEN".to_string()],
+                user_tip: None,
+            }
         );
     }
 
     #[test]
-    fn bootstrap_login_args_reuse_effective_config_dir() {
-        assert_eq!(
-            bootstrap_login_args(&[]),
-            vec![
-                "login".to_string(),
-                "--config-dir".to_string(),
-                DEFAULT_COPILOT_CONFIG_DIR.to_string(),
-            ]
+    fn provider_auth_env_uses_host_gh_token_when_needed() {
+        let resolved = resolve_provider_auth_env(
+            Vec::new(),
+            GhAuthStatus::Authenticated("host-token".to_string()),
         );
+
         assert_eq!(
-            bootstrap_login_args(&[
-                "--config-dir".to_string(),
-                "/workspace/copilot-config".to_string(),
-                "--resume".to_string(),
-            ]),
-            vec![
-                "login".to_string(),
-                "--config-dir".to_string(),
-                "/workspace/copilot-config".to_string(),
-            ]
+            resolved,
+            ProviderAuthEnv {
+                passthrough_env: vec![(
+                    "COPILOT_GITHUB_TOKEN".to_string(),
+                    "host-token".to_string(),
+                )],
+                secret_env_vars: vec!["COPILOT_GITHUB_TOKEN".to_string()],
+                user_tip: None,
+            }
         );
     }
 
     #[test]
-    fn managed_host_paths_cover_home_and_workspace_mounts() {
-        let root = unique_test_dir("managed-host-paths");
-        let config = AppConfig::for_tests(&root);
-        let workspace = root.join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
+    fn provider_auth_env_emits_tip_when_gh_needs_login() {
+        let resolved = resolve_provider_auth_env(Vec::new(), GhAuthStatus::NotAuthenticated);
 
         assert_eq!(
-            managed_host_path_for_container_path(&config, &workspace, DEFAULT_COPILOT_CONFIG_DIR)
-                .unwrap(),
-            workspace_home_for(&config, &workspace).join(".copilot")
+            resolved,
+            ProviderAuthEnv {
+                passthrough_env: Vec::new(),
+                secret_env_vars: Vec::new(),
+                user_tip: Some(GH_AUTH_REUSE_TIP),
+            }
         );
-        assert_eq!(
-            managed_host_path_for_container_path(&config, &workspace, "/workspace/.copilot")
-                .unwrap(),
-            workspace.join(".copilot")
-        );
-        assert_eq!(
-            managed_host_path_for_container_path(&config, &workspace, "relative-config").unwrap(),
-            workspace.join("relative-config")
-        );
-        assert!(managed_host_path_for_container_path(&config, &workspace, "../escape").is_none());
-        assert!(
-            managed_host_path_for_container_path(
-                &config,
-                &workspace,
-                "/home/copilot/../../../tmp/escape"
-            )
-            .is_none()
-        );
-        assert!(
-            managed_host_path_for_container_path(&config, &workspace, "/workspace/../escape")
-                .is_none()
-        );
-        assert!(
-            managed_host_path_for_container_path(&config, &workspace, "/tmp/copilot").is_none()
-        );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn auth_bootstrap_lock_rejects_parallel_claims_and_cleans_up() {
-        let root = unique_test_dir("auth-bootstrap-lock");
-        fs::create_dir_all(&root).unwrap();
-        let marker = root.join(AUTH_MARKER_FILE);
-
-        let lock = acquire_auth_bootstrap_lock(Some(&marker)).unwrap();
-        let error = acquire_auth_bootstrap_lock(Some(&marker)).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Copilot login bootstrap is already running")
-        );
-
-        drop(lock);
-
-        let _lock = acquire_auth_bootstrap_lock(Some(&marker)).unwrap();
-        let _ = fs::remove_dir_all(root);
+    fn gh_auth_tip_only_shows_for_real_session_launches() {
+        assert!(should_emit_gh_auth_tip(&[]));
+        assert!(should_emit_gh_auth_tip(&[
+            "--resume".to_string(),
+            "session-123".to_string()
+        ]));
+        assert!(!should_emit_gh_auth_tip(&["login".to_string()]));
+        assert!(!should_emit_gh_auth_tip(&["--help".to_string()]));
+        assert!(!should_emit_gh_auth_tip(&["version".to_string()]));
     }
 
     #[test]
-    fn stale_auth_bootstrap_lock_is_removed_when_pid_is_dead() {
-        let root = unique_test_dir("stale-auth-bootstrap-lock");
-        fs::create_dir_all(&root).unwrap();
-        let marker = root.join(AUTH_MARKER_FILE);
-        let lock_path = auth_bootstrap_lock_path(&marker);
-        fs::write(&lock_path, "999999\n0\n").unwrap();
-
-        assert!(try_remove_stale_auth_bootstrap_lock(&lock_path).unwrap());
-        assert!(!lock_path.exists());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn transient_session_cleanup_removes_session_directory() {
-        let root = unique_test_dir("transient-session-cleanup");
-        let config = AppConfig::for_tests(&root);
-        let workspace = root.join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
-        let session = SessionContext::new_transient_session(&config, workspace, &[]).unwrap();
-        let session_dir = session.session_dir().to_path_buf();
-
-        {
-            let _cleanup = TransientSessionCleanup::new(session_dir.clone());
-        }
-
-        assert!(!session_dir.exists());
-
-        let _ = fs::remove_dir_all(root);
+    fn entrypoint_invokes_copilot_detects_wrapper_scripts() {
+        assert!(entrypoint_invokes_copilot(r#"["copilot"]"#));
+        assert!(entrypoint_invokes_copilot(
+            r#"["sh","-lc","echo overlay-entrypoint; exec copilot \"$@\"","--"]"#
+        ));
+        assert!(!entrypoint_invokes_copilot(r#"["bash","-lc"]"#));
     }
 
     #[test]
