@@ -3,11 +3,10 @@ use crate::config::AppConfig;
 use crate::egress::{BROKER_INTERNAL_HOST, parse_target_spec};
 use crate::session::{SessionContext, workspace_key, write_atomic};
 use crate::ui::ApprovalsHub;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -20,6 +19,8 @@ const REPO_OVERLAY_BASE_IMAGE_ARG: &str = "LLM_BOX_BASE_IMAGE";
 const PROVIDER_AUTH_ENV_KEYS: &[&str] = &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
 const GH_AUTH_REUSE_TIP: &str = "llm-box: no reusable GitHub token found. Tip: run `gh auth login` on the host to let llm-box reuse your GitHub auth.";
 const MANAGED_COPILOT_CONFIG_DIR: &str = "/home/copilot/.llm-box/providers/copilot";
+const IMAGE_LABEL_EGRESS_BROKER: &str = "io.github.llm-box.egress-broker";
+const IMAGE_LABEL_COPILOT_ARGS_COMPATIBLE: &str = "io.github.llm-box.copilot-args-compatible";
 const LEGACY_AUTH_MARKER_FILE: &str = "llm-box-authenticated.json";
 const WORKSPACE_STATE_VERSION: u32 = 1;
 const WORKSPACE_STATE_VERSION_FILE: &str = "workspace-state.json";
@@ -32,6 +33,7 @@ USER root
 # RUN apt-get update \
 #   && apt-get install -y --no-install-recommends gh \
 #   && rm -rf /var/lib/apt/lists/*
+# LABEL io.github.llm-box.copilot-args-compatible="0"  # Uncomment if your custom entrypoint no longer forwards to `copilot`
 USER copilot
 "#;
 
@@ -56,6 +58,20 @@ struct ProviderAuthEnv {
     passthrough_env: Vec<(String, String)>,
     secret_env_vars: Vec<String>,
     user_tip: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedCopilotLaunch {
+    invocation_args: Vec<String>,
+    provider_auth: ProviderAuthEnv,
+    secret_env_vars: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OptionalCommandOutput {
+    Success(String),
+    ExitedNonZero(String),
+    TimedOut,
 }
 
 pub(crate) fn build_image(config: &AppConfig) -> Result<()> {
@@ -86,21 +102,7 @@ pub(crate) fn run_copilot(config: &AppConfig, args: &[String]) -> Result<i32> {
     let runtime = detect_runtime()?;
     ensure_runtime_ready(&runtime)?;
     let image_name = ensure_copilot_image(config, &runtime, &workspace)?;
-    let workspace_home = workspace_home_for(config, &workspace);
-    migrate_workspace_home_state(&workspace_home)?;
-    let explicit_auth_env = collect_passthrough_env(PROVIDER_AUTH_ENV_KEYS);
-    let gh_auth_status = if explicit_auth_env.is_empty() {
-        query_host_gh_auth_status()
-    } else {
-        GhAuthStatus::Unavailable
-    };
-    let provider_auth = resolve_provider_auth_env(explicit_auth_env, gh_auth_status);
-    let image_uses_copilot = image_entrypoint_uses_copilot(&runtime, &image_name)?;
-    let invocation_args = if image_uses_copilot {
-        inject_managed_config_dir(args)
-    } else {
-        args.to_vec()
-    };
+    let launch = prepare_copilot_launch(config, &runtime, &workspace, &image_name, args)?;
     let session = SessionContext::new_session(config, workspace, args)?;
     let _active_session = session.mark_active()?;
     let network = SessionNetwork::create(&runtime, session.session_id())?;
@@ -115,13 +117,8 @@ pub(crate) fn run_copilot(config: &AppConfig, args: &[String]) -> Result<i32> {
 
     let uid = current_command_output("id", ["-u"])?;
     let gid = current_command_output("id", ["-g"])?;
-    let secret_env_vars = if provider_auth.secret_env_vars.is_empty() || !image_uses_copilot {
-        Vec::new()
-    } else {
-        provider_auth.secret_env_vars.clone()
-    };
     if should_emit_gh_auth_tip(args) {
-        if let Some(tip) = provider_auth.user_tip {
+        if let Some(tip) = launch.provider_auth.user_tip {
             eprintln!("{tip}");
         }
     }
@@ -132,9 +129,9 @@ pub(crate) fn run_copilot(config: &AppConfig, args: &[String]) -> Result<i32> {
         &uid,
         &gid,
         tty_mode,
-        &invocation_args,
-        &provider_auth.passthrough_env,
-        &secret_env_vars,
+        &launch.invocation_args,
+        &launch.provider_auth.passthrough_env,
+        &launch.secret_env_vars,
         config.shared_copilot_skills_dir(),
     );
     let mut command = plan.command(&runtime);
@@ -265,11 +262,45 @@ fn resolve_provider_auth_env(
     }
 }
 
-fn query_host_gh_auth_status() -> GhAuthStatus {
+fn prepare_copilot_launch(
+    config: &AppConfig,
+    runtime: &str,
+    workspace: &Path,
+    image_name: &str,
+    args: &[String],
+) -> Result<PreparedCopilotLaunch> {
+    let workspace_home = workspace_home_for(config, workspace);
+    migrate_workspace_home_state(&workspace_home)?;
+    let explicit_auth_env = collect_passthrough_env(PROVIDER_AUTH_ENV_KEYS);
+    let gh_auth_status = if explicit_auth_env.is_empty() {
+        query_host_gh_auth_status()?
+    } else {
+        GhAuthStatus::Unavailable
+    };
+    let provider_auth = resolve_provider_auth_env(explicit_auth_env, gh_auth_status);
+    let image_supports_copilot_args = image_supports_copilot_args(runtime, image_name)?;
+    let invocation_args = if image_supports_copilot_args {
+        inject_managed_config_dir(args)
+    } else {
+        args.to_vec()
+    };
+    let secret_env_vars = if image_supports_copilot_args {
+        provider_auth.secret_env_vars.clone()
+    } else {
+        Vec::new()
+    };
+    Ok(PreparedCopilotLaunch {
+        invocation_args,
+        provider_auth,
+        secret_env_vars,
+    })
+}
+
+fn query_host_gh_auth_status() -> Result<GhAuthStatus> {
     if !command_exists("gh") {
-        return GhAuthStatus::Unavailable;
+        return Ok(GhAuthStatus::Unavailable);
     }
-    match try_optional_command_output(
+    match run_optional_command_with_timeout(
         "gh",
         ["auth", "token"],
         &[
@@ -280,10 +311,29 @@ fn query_host_gh_auth_status() -> GhAuthStatus {
         ],
         HOST_GH_AUTH_LOOKUP_TIMEOUT,
     ) {
-        Ok(Some(token)) => GhAuthStatus::Authenticated(token),
-        Ok(None) => GhAuthStatus::NotAuthenticated,
-        Err(_) => GhAuthStatus::Unavailable,
+        Ok(OptionalCommandOutput::Success(token)) => Ok(GhAuthStatus::Authenticated(token)),
+        Ok(OptionalCommandOutput::ExitedNonZero(stderr))
+            if gh_auth_failure_is_not_authenticated(&stderr) =>
+        {
+            Ok(GhAuthStatus::NotAuthenticated)
+        }
+        Ok(OptionalCommandOutput::ExitedNonZero(stderr)) => {
+            bail!("`gh auth token` failed: {}", stderr.trim())
+        }
+        Ok(OptionalCommandOutput::TimedOut) => {
+            bail!("`gh auth token` timed out while probing host authentication")
+        }
+        Err(error) => Err(error).context("failed to probe host GitHub authentication via `gh`"),
     }
+}
+
+fn gh_auth_failure_is_not_authenticated(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("not logged in")
+        || stderr.contains("not logged into")
+        || stderr.contains("no oauth token found")
+        || stderr.contains("no token found")
+        || stderr.contains("authentication required")
 }
 
 fn should_emit_gh_auth_tip(args: &[String]) -> bool {
@@ -552,44 +602,27 @@ fn image_exists(runtime: &str, image_name: &str) -> Result<bool> {
 }
 
 fn image_supports_broker(runtime: &str, image_name: &str) -> Result<bool> {
+    image_label_is_enabled(runtime, image_name, IMAGE_LABEL_EGRESS_BROKER)
+}
+
+fn image_supports_copilot_args(runtime: &str, image_name: &str) -> Result<bool> {
+    image_label_is_enabled(runtime, image_name, IMAGE_LABEL_COPILOT_ARGS_COMPATIBLE)
+}
+
+fn image_label_is_enabled(runtime: &str, image_name: &str, label: &str) -> Result<bool> {
     let output = Command::new(runtime)
         .args([
             "image",
             "inspect",
             "--format",
-            "{{index .Config.Labels \"io.github.llm-box.egress-broker\"}}",
+            &format!("{{{{index .Config.Labels \"{label}\"}}}}"),
             image_name,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
-        .with_context(|| format!("failed to inspect labels for image `{image_name}`"))?;
+        .with_context(|| format!("failed to inspect label `{label}` for image `{image_name}`"))?;
     Ok(output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1")
-}
-
-fn image_entrypoint_uses_copilot(runtime: &str, image_name: &str) -> Result<bool> {
-    let output = Command::new(runtime)
-        .args([
-            "image",
-            "inspect",
-            "--format",
-            "{{json .Config.Entrypoint}}",
-            image_name,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .with_context(|| format!("failed to inspect entrypoint for image `{image_name}`"))?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    let entrypoint =
-        String::from_utf8(output.stdout).context("image entrypoint was not valid utf-8")?;
-    Ok(entrypoint_invokes_copilot(&entrypoint))
-}
-
-fn entrypoint_invokes_copilot(entrypoint: &str) -> bool {
-    entrypoint.to_ascii_lowercase().contains("copilot")
 }
 
 fn detect_runtime() -> Result<String> {
@@ -658,32 +691,44 @@ where
         .to_string())
 }
 
-fn try_optional_command_output<I, S>(
+fn run_optional_command_with_timeout<I, S>(
     program: &str,
     args: I,
     env_overrides: &[(&str, &str)],
     timeout: Duration,
-) -> Result<Option<String>>
+) -> Result<OptionalCommandOutput>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let stdout_path = unique_runtime_temp_path(program, "stdout");
-    let stderr_path = unique_runtime_temp_path(program, "stderr");
-    let stdout = File::create(&stdout_path)
-        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
-    let stderr = File::create(&stderr_path)
-        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
     let mut command = Command::new(program);
     command
         .args(args)
         .envs(env_overrides.iter().copied())
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to run `{program}`"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("failed to capture command stdout")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("failed to capture command stderr")?;
+    let reader = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
+    let error_reader = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -691,46 +736,40 @@ where
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = fs::remove_file(&stdout_path);
-                let _ = fs::remove_file(&stderr_path);
-                return Ok(None);
+                let _ = reader.join();
+                let _ = error_reader.join();
+                return Ok(OptionalCommandOutput::TimedOut);
             }
             Ok(None) => thread::sleep(OPTIONAL_COMMAND_POLL_INTERVAL),
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = fs::remove_file(&stdout_path);
-                let _ = fs::remove_file(&stderr_path);
+                let _ = reader.join();
+                let _ = error_reader.join();
                 return Err(error).with_context(|| format!("failed to poll `{program}`"));
             }
         }
     };
-    let stdout = fs::read(stdout_path.as_path())
-        .with_context(|| format!("failed to read {}", stdout_path.display()))?;
-    let _ = fs::remove_file(&stdout_path);
-    let _ = fs::remove_file(&stderr_path);
+    let stdout = reader
+        .join()
+        .map_err(|_| anyhow!("stdout reader thread panicked for `{program}`"))?
+        .with_context(|| format!("failed to read stdout for `{program}`"))?;
+    let stderr = error_reader
+        .join()
+        .map_err(|_| anyhow!("stderr reader thread panicked for `{program}`"))?
+        .with_context(|| format!("failed to read stderr for `{program}`"))?;
     if !status.success() {
-        return Ok(None);
+        return Ok(OptionalCommandOutput::ExitedNonZero(
+            String::from_utf8_lossy(&stderr).trim().to_string(),
+        ));
     }
     let stdout = String::from_utf8(stdout).context("command output was not valid utf-8")?;
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
-        Ok(None)
+        bail!("`{program}` exited successfully but returned empty output")
     } else {
-        Ok(Some(trimmed.to_string()))
+        Ok(OptionalCommandOutput::Success(trimmed.to_string()))
     }
-}
-
-fn unique_runtime_temp_path(program: &str, suffix: &str) -> PathBuf {
-    let sanitized = program.replace(std::path::MAIN_SEPARATOR, "_");
-    env::temp_dir().join(format!(
-        "llm-box-{sanitized}-{suffix}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ))
 }
 
 fn workspace_home_for(config: &AppConfig, workspace: &Path) -> PathBuf {
@@ -1243,12 +1282,16 @@ mod tests {
     }
 
     #[test]
-    fn try_optional_command_output_times_out() {
-        let result =
-            try_optional_command_output("sh", ["-c", "sleep 1"], &[], Duration::from_millis(10))
-                .unwrap();
+    fn run_optional_command_with_timeout_times_out() {
+        let result = run_optional_command_with_timeout(
+            "sh",
+            ["-c", "sleep 1"],
+            &[],
+            Duration::from_millis(10),
+        )
+        .unwrap();
 
-        assert_eq!(result, None);
+        assert_eq!(result, OptionalCommandOutput::TimedOut);
     }
 
     #[test]
@@ -1387,12 +1430,20 @@ mod tests {
     }
 
     #[test]
-    fn entrypoint_invokes_copilot_detects_wrapper_scripts() {
-        assert!(entrypoint_invokes_copilot(r#"["copilot"]"#));
-        assert!(entrypoint_invokes_copilot(
-            r#"["sh","-lc","echo overlay-entrypoint; exec copilot \"$@\"","--"]"#
-        ));
-        assert!(!entrypoint_invokes_copilot(r#"["bash","-lc"]"#));
+    fn config_dir_arg_parses_supported_forms() {
+        assert_eq!(config_dir_arg(&[]), ConfigDirArg::Absent);
+        assert_eq!(
+            config_dir_arg(&["--config-dir".to_string(), "/workspace/copilot".to_string()]),
+            ConfigDirArg::Present("/workspace/copilot".to_string())
+        );
+        assert_eq!(
+            config_dir_arg(&["--config-dir=/workspace/copilot".to_string()]),
+            ConfigDirArg::Present("/workspace/copilot".to_string())
+        );
+        assert_eq!(
+            config_dir_arg(&["--config-dir".to_string()]),
+            ConfigDirArg::MissingValue
+        );
     }
 
     #[test]

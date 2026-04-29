@@ -303,17 +303,12 @@ impl SessionStore {
                 });
             }
         };
-        let info: ActiveProcessInfo = match serde_json::from_str(&raw) {
-            Ok(info) => info,
-            Err(_) => {
-                let _ = fs::remove_file(&self.active_process_file);
-                return Ok(false);
-            }
-        };
+        let info: ActiveProcessInfo = serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {}", self.active_process_file.display()))?;
         if process_is_running(info.pid) {
             Ok(true)
         } else {
-            let _ = fs::remove_file(&self.active_process_file);
+            remove_file_if_exists(&self.active_process_file)?;
             Ok(false)
         }
     }
@@ -543,8 +538,10 @@ fn acquire_file_lock(target: &Path) -> Result<FileLock> {
             .open(&lock_path)
         {
             Ok(mut file) => {
-                let _ = writeln!(file, "{}", process::id());
-                let _ = writeln!(file, "{}", current_epoch_seconds());
+                if let Err(error) = write_lock_metadata(&mut file, &lock_path) {
+                    let _ = fs::remove_file(&lock_path);
+                    return Err(error);
+                }
                 return Ok(FileLock {
                     _file: file,
                     path: lock_path,
@@ -579,22 +576,23 @@ fn try_remove_stale_lock(lock_path: &Path) -> Result<bool> {
         }
     };
 
-    let created_epoch = contents
-        .lines()
-        .nth(1)
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    let is_stale = created_epoch
-        .map(|epoch| {
-            current_epoch_seconds().saturating_sub(epoch) >= FILE_LOCK_STALE_AFTER.as_secs()
-        })
-        .unwrap_or_else(|| {
-            fs::metadata(lock_path)
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                .map(|age| age >= FILE_LOCK_STALE_AFTER)
-                .unwrap_or(false)
-        });
+    let created_epoch = match contents.lines().nth(1) {
+        Some(value) => value.trim().parse::<u64>().with_context(|| {
+            format!(
+                "failed to parse {}; invalid lock timestamp",
+                lock_path.display()
+            )
+        })?,
+        None if lock_file_age(lock_path)? < FILE_LOCK_STALE_AFTER => return Ok(false),
+        None => {
+            bail!(
+                "failed to parse {}; missing lock timestamp",
+                lock_path.display()
+            )
+        }
+    };
+    let is_stale =
+        current_epoch_seconds().saturating_sub(created_epoch) >= FILE_LOCK_STALE_AFTER.as_secs();
     if !is_stale {
         return Ok(false);
     }
@@ -608,6 +606,33 @@ fn try_remove_stale_lock(lock_path: &Path) -> Result<bool> {
     }
 }
 
+fn lock_file_age(path: &Path) -> Result<Duration> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let modified = metadata
+        .modified()
+        .with_context(|| format!("failed to inspect mtime for {}", path.display()))?;
+    SystemTime::now()
+        .duration_since(modified)
+        .with_context(|| format!("lock file mtime is in the future for {}", path.display()))
+}
+
+fn write_lock_metadata(file: &mut fs::File, lock_path: &Path) -> Result<()> {
+    writeln!(file, "{}", process::id())
+        .with_context(|| format!("failed to write pid to {}", lock_path.display()))?;
+    writeln!(file, "{}", current_epoch_seconds())
+        .with_context(|| format!("failed to write timestamp to {}", lock_path.display()))?;
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
 fn lock_path_for(target: &Path) -> PathBuf {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     let file_name = target
@@ -617,6 +642,7 @@ fn lock_path_for(target: &Path) -> PathBuf {
     parent.join(format!(".{file_name}.lock"))
 }
 
+#[derive(Debug)]
 struct FileLock {
     _file: fs::File,
     path: PathBuf,
@@ -1055,6 +1081,20 @@ mod tests {
     }
 
     #[test]
+    fn active_session_reports_invalid_process_markers() {
+        let root = unique_test_dir("active-session-invalid");
+        let store = session_store_fixture(&root);
+        fs::write(store.active_process_file(), "{not-json}\n").unwrap();
+
+        let error = store.is_active_session().unwrap_err();
+
+        assert!(error.to_string().contains("failed to parse"));
+        assert!(store.active_process_file().exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn deny_target_removes_connector_mapping() {
         let root = unique_test_dir("deny-removes-connector");
         let config = AppConfig::for_tests(&root);
@@ -1184,6 +1224,22 @@ mod tests {
         }
 
         assert!(!lock_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn acquire_file_lock_reports_invalid_lock_metadata() {
+        let root = unique_test_dir("invalid-lock-file");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("allowed-targets.txt");
+        let lock_path = lock_path_for(&target);
+        fs::write(&lock_path, "999999\nnot-a-timestamp\n").unwrap();
+
+        let error = acquire_file_lock(&target).unwrap_err();
+
+        assert!(error.to_string().contains("invalid lock timestamp"));
+        assert!(lock_path.exists());
+
         let _ = fs::remove_dir_all(root);
     }
 

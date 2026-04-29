@@ -7,7 +7,8 @@ RUN cargo build --release --locked
 
 FROM node:22-slim
 
-LABEL io.github.llm-box.egress-broker="1"
+LABEL io.github.llm-box.egress-broker="1" \
+      io.github.llm-box.copilot-args-compatible="1"
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl git openssh-client \

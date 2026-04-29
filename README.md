@@ -123,6 +123,12 @@ That creates:
 .llm-box/Dockerfile
 ```
 
+If your custom image replaces the entrypoint and no longer forwards arguments to `copilot`, add:
+
+```bash
+LABEL io.github.llm-box.copilot-args-compatible="0"
+```
+
 If you want to prebuild the image for the current workspace:
 
 ```bash

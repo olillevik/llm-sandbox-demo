@@ -177,6 +177,7 @@ mkdir -p "$WORKSPACE_D/.llm-box"
 cat >"$WORKSPACE_D/.llm-box/Dockerfile" <<'EOF'
 ARG LLM_BOX_BASE_IMAGE
 FROM ${LLM_BOX_BASE_IMAGE}
+LABEL io.github.llm-box.copilot-args-compatible="1"
 ENTRYPOINT ["sh", "-lc", "echo overlay-entrypoint; exec copilot \"$@\"", "--"]
 EOF
 
@@ -186,6 +187,7 @@ echo "$OVERLAY_OUTPUT" | grep -q "overlay-entrypoint" || fail "repo overlay imag
 
 "$RUNTIME" build -q -t "$TEST_IMAGE" -f - . <<'EOF' >/dev/null
 FROM llm-box
+LABEL io.github.llm-box.copilot-args-compatible="0"
 ENTRYPOINT ["bash", "-lc"]
 EOF
 
