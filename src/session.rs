@@ -718,7 +718,7 @@ struct ActiveProcessInfo {
 }
 
 #[cfg(unix)]
-fn process_is_running(pid: u32) -> bool {
+pub(crate) fn process_is_running(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(Stdio::null())
@@ -729,7 +729,7 @@ fn process_is_running(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn process_is_running(pid: u32) -> bool {
+pub(crate) fn process_is_running(pid: u32) -> bool {
     pid == process::id()
 }
 

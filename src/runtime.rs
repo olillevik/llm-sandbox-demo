@@ -1,24 +1,28 @@
 use crate::broker;
 use crate::config::AppConfig;
 use crate::egress::{BROKER_INTERNAL_HOST, parse_target_spec};
-use crate::session::{SessionContext, current_epoch_seconds, workspace_key, write_atomic};
+use crate::session::{
+    SessionContext, current_epoch_seconds, process_is_running, workspace_key, write_atomic,
+};
 use crate::ui::ApprovalsHub;
 use anyhow::{Context, Result, bail};
 use std::env;
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const REPO_OVERLAY_DOCKERFILE: &str = ".llm-box/Dockerfile";
 const REPO_OVERLAY_BASE_IMAGE_ARG: &str = "LLM_BOX_BASE_IMAGE";
 const DEFAULT_COPILOT_CONFIG_DIR: &str = "/home/copilot/.copilot";
 const AUTH_MARKER_FILE: &str = "llm-box-authenticated.json";
 const DEFAULT_LOGIN_TARGET: &str = "https://github.com:443";
+const AUTH_BOOTSTRAP_LOCK_STALE_AFTER: Duration = Duration::from_secs(60 * 60);
 const INIT_IMAGE_TEMPLATE: &str = r#"ARG LLM_BOX_BASE_IMAGE
 FROM ${LLM_BOX_BASE_IMAGE}
 
@@ -43,6 +47,34 @@ enum ConfigDirArg {
     Absent,
     Present(String),
     MissingValue,
+}
+
+#[derive(Debug)]
+struct AuthBootstrapLock {
+    path: PathBuf,
+    _file: fs::File,
+}
+
+impl Drop for AuthBootstrapLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct TransientSessionCleanup {
+    session_dir: PathBuf,
+}
+
+impl TransientSessionCleanup {
+    fn new(session_dir: PathBuf) -> Self {
+        Self { session_dir }
+    }
+}
+
+impl Drop for TransientSessionCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.session_dir);
+    }
 }
 
 pub(crate) fn build_image(config: &AppConfig) -> Result<()> {
@@ -87,6 +119,10 @@ pub(crate) fn run_copilot(config: &AppConfig, args: &[String]) -> Result<i32> {
     if can_manage_auth {
         match invocation_mode {
             CopilotInvocationMode::ExplicitLogin => {
+                let _bootstrap_lock = match auth_marker.as_deref() {
+                    Some(marker) => Some(acquire_auth_bootstrap_lock(Some(marker))?),
+                    None => None,
+                };
                 let exit_code = run_copilot_bootstrap(
                     config,
                     &runtime,
@@ -101,6 +137,17 @@ pub(crate) fn run_copilot(config: &AppConfig, args: &[String]) -> Result<i32> {
             }
             CopilotInvocationMode::AutoSession => {
                 if should_bootstrap_auth(auth_marker.as_deref()) {
+                    let _bootstrap_lock = acquire_auth_bootstrap_lock(auth_marker.as_deref())?;
+                    if auth_marker.as_deref().is_some_and(Path::is_file) {
+                        // Another launch finished bootstrap while we were claiming the lock.
+                        return run_copilot_in_new_session(
+                            config,
+                            &runtime,
+                            &image_name,
+                            &workspace,
+                            &session_args,
+                        );
+                    }
                     let bootstrap_args = bootstrap_login_args(&session_args);
                     let exit_code = run_copilot_bootstrap(
                         config,
@@ -119,16 +166,7 @@ pub(crate) fn run_copilot(config: &AppConfig, args: &[String]) -> Result<i32> {
         }
     }
 
-    let session = SessionContext::new_session(config, workspace, &session_args)?;
-    run_copilot_in_session(
-        config,
-        &runtime,
-        &image_name,
-        &session,
-        &session_args,
-        true,
-        true,
-    )
+    run_copilot_in_new_session(config, &runtime, &image_name, &workspace, &session_args)
 }
 
 fn run_copilot_bootstrap(
@@ -139,8 +177,20 @@ fn run_copilot_bootstrap(
     args: &[String],
 ) -> Result<i32> {
     let session = SessionContext::new_transient_session(config, workspace.to_path_buf(), args)?;
+    let _cleanup = TransientSessionCleanup::new(session.session_dir().to_path_buf());
     session.allow_target(&bootstrap_login_target(args)?)?;
     run_copilot_in_session(config, runtime, image_name, &session, args, false, false)
+}
+
+fn run_copilot_in_new_session(
+    config: &AppConfig,
+    runtime: &str,
+    image_name: &str,
+    workspace: &Path,
+    args: &[String],
+) -> Result<i32> {
+    let session = SessionContext::new_session(config, workspace.to_path_buf(), args)?;
+    run_copilot_in_session(config, runtime, image_name, &session, args, true, true)
 }
 
 fn run_copilot_in_session(
@@ -307,16 +357,16 @@ fn managed_host_path_for_container_path(
         return if container_path == "/home/copilot" {
             Some(workspace_home)
         } else if let Some(stripped) = container_path.strip_prefix("/home/copilot/") {
-            Some(workspace_home.join(stripped))
+            safe_join_relative(&workspace_home, stripped)
         } else if container_path == "/workspace" {
             Some(workspace.to_path_buf())
         } else {
             container_path
                 .strip_prefix("/workspace/")
-                .map(|stripped| workspace.join(stripped))
+                .and_then(|stripped| safe_join_relative(workspace, stripped))
         };
     }
-    Some(workspace.join(container_path))
+    safe_join_relative(workspace, container_path)
 }
 
 fn workspace_home_for(config: &AppConfig, workspace: &Path) -> PathBuf {
@@ -335,6 +385,115 @@ fn persist_auth_marker(marker: Option<&Path>) -> Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     write_atomic(marker, format!("{}\n", current_epoch_seconds()).as_bytes())
+}
+
+fn safe_join_relative(root: &Path, relative: &str) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in Path::new(relative).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(root.join(normalized))
+}
+
+fn acquire_auth_bootstrap_lock(auth_marker: Option<&Path>) -> Result<AuthBootstrapLock> {
+    let auth_marker = auth_marker.context(
+        "cannot manage Copilot auth bootstrap for an unmapped config directory; pass a config dir under /home/copilot or /workspace",
+    )?;
+    let lock_path = auth_bootstrap_lock_path(auth_marker);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                writeln!(file, "{}", std::process::id())
+                    .with_context(|| format!("failed to write {}", lock_path.display()))?;
+                writeln!(file, "{}", current_epoch_seconds())
+                    .with_context(|| format!("failed to write {}", lock_path.display()))?;
+                return Ok(AuthBootstrapLock {
+                    path: lock_path,
+                    _file: file,
+                });
+            }
+            Err(error)
+                if error.kind() == ErrorKind::AlreadyExists
+                    && try_remove_stale_auth_bootstrap_lock(&lock_path)? =>
+            {
+                continue;
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                bail!("Copilot login bootstrap is already running for this workspace");
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to create {}", lock_path.display()));
+            }
+        }
+    }
+}
+
+fn auth_bootstrap_lock_path(auth_marker: &Path) -> PathBuf {
+    let parent = auth_marker.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = auth_marker
+        .file_name()
+        .unwrap_or_else(|| OsStr::new(AUTH_MARKER_FILE))
+        .to_string_lossy();
+    parent.join(format!(".{file_name}.bootstrap.lock"))
+}
+
+fn try_remove_stale_auth_bootstrap_lock(lock_path: &Path) -> Result<bool> {
+    let contents = match fs::read_to_string(lock_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", lock_path.display()));
+        }
+    };
+
+    let pid = contents
+        .lines()
+        .next()
+        .and_then(|value| value.trim().parse::<u32>().ok());
+    let created_epoch = contents
+        .lines()
+        .nth(1)
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let is_stale = match pid {
+        Some(pid) => !process_is_running(pid),
+        None => created_epoch
+            .map(|epoch| {
+                current_epoch_seconds().saturating_sub(epoch)
+                    >= AUTH_BOOTSTRAP_LOCK_STALE_AFTER.as_secs()
+            })
+            .unwrap_or_else(|| {
+                fs::metadata(lock_path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                    .map(|age| age >= AUTH_BOOTSTRAP_LOCK_STALE_AFTER)
+                    .unwrap_or(false)
+            }),
+    };
+    if !is_stale {
+        return Ok(false);
+    }
+
+    match fs::remove_file(lock_path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to remove {}", lock_path.display()))
+        }
+    }
 }
 
 pub(crate) fn request_connector_endpoint_from_broker(target: &str) -> Result<(String, String)> {
@@ -1223,9 +1382,74 @@ mod tests {
             managed_host_path_for_container_path(&config, &workspace, "relative-config").unwrap(),
             workspace.join("relative-config")
         );
+        assert!(managed_host_path_for_container_path(&config, &workspace, "../escape").is_none());
+        assert!(
+            managed_host_path_for_container_path(
+                &config,
+                &workspace,
+                "/home/copilot/../../../tmp/escape"
+            )
+            .is_none()
+        );
+        assert!(
+            managed_host_path_for_container_path(&config, &workspace, "/workspace/../escape")
+                .is_none()
+        );
         assert!(
             managed_host_path_for_container_path(&config, &workspace, "/tmp/copilot").is_none()
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auth_bootstrap_lock_rejects_parallel_claims_and_cleans_up() {
+        let root = unique_test_dir("auth-bootstrap-lock");
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join(AUTH_MARKER_FILE);
+
+        let lock = acquire_auth_bootstrap_lock(Some(&marker)).unwrap();
+        let error = acquire_auth_bootstrap_lock(Some(&marker)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Copilot login bootstrap is already running")
+        );
+
+        drop(lock);
+
+        let _lock = acquire_auth_bootstrap_lock(Some(&marker)).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_auth_bootstrap_lock_is_removed_when_pid_is_dead() {
+        let root = unique_test_dir("stale-auth-bootstrap-lock");
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join(AUTH_MARKER_FILE);
+        let lock_path = auth_bootstrap_lock_path(&marker);
+        fs::write(&lock_path, "999999\n0\n").unwrap();
+
+        assert!(try_remove_stale_auth_bootstrap_lock(&lock_path).unwrap());
+        assert!(!lock_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transient_session_cleanup_removes_session_directory() {
+        let root = unique_test_dir("transient-session-cleanup");
+        let config = AppConfig::for_tests(&root);
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let session = SessionContext::new_transient_session(&config, workspace, &[]).unwrap();
+        let session_dir = session.session_dir().to_path_buf();
+
+        {
+            let _cleanup = TransientSessionCleanup::new(session_dir.clone());
+        }
+
+        assert!(!session_dir.exists());
 
         let _ = fs::remove_dir_all(root);
     }
