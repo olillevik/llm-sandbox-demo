@@ -99,7 +99,7 @@ The session keeps running while you make these decisions.
 
 ## Defaults
 
-Each new session starts with a small built-in allowlist for GitHub plus the core Copilot API and telemetry endpoints.
+Each new session starts with a small built-in allowlist for GitHub plus the core Copilot Business and Individual API and telemetry endpoints.
 
 You can also manage your own defaults for future sessions:
 
